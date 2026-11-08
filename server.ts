@@ -244,71 +244,95 @@ if (!isSmtpConfigured()) {
 // Shared helper: dispatch the verification email to the EXACT registered email.
 // Returns true on successful delivery, throws on failure. NEVER returns the
 // token or URL — those stay strictly server-side.
+//
+// EMAIL FORMAT (as specified by product owner):
+//   From:    SurgiTrack Verification <noreply@surgitrack.com>
+//   Subject: Verify your SurgiTrack account:
+//   Body:    Welcome to SurgiTrack iLog.
+//            Please verify your email address to activate your account.
+//            [Verify Account button → verificationUrl]
+//            This is an automated security message.
 const dispatchVerificationEmail = async (
   toEmail: string,
   displayName: string,
   verificationUrl: string,
   isResend: boolean
 ): Promise<void> => {
-  const subject = isResend
-    ? 'New Verification Link for Your SurgiTrack Account (30 Seconds)'
-    : 'Verify Your SurgiTrack iLog Account (Valid for 30 Seconds)';
+  // Unified subject line for both initial registration and resend flows.
+  const subject = 'Verify your SurgiTrack account:';
 
-  const introParagraph = isResend
-    ? '<p>A new email verification link has been requested for your SurgiTrack iLog account.</p>'
-    : '<p>Thank you for registering your clinical portfolio with <strong>SurgiTrack iLog</strong>. To ensure the authenticity of surgical trainee accounts and safeguard confidential medical records, please verify your email address by clicking the link below.</p>';
-
-  const mailHtml = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
-        .container { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-        .header { background: #101C32; padding: 28px 24px; text-align: center; border-bottom: 3px solid #0D9488; }
-        .title { color: #ffffff; font-size: 20px; font-weight: 800; margin: 0; }
-        .badge { color: #5eead4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-top: 4px; display: block; }
-        .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.6; }
-        .greeting { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
-        .alert-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px; padding: 14px; margin: 18px 0; color: #166534; font-size: 13px; }
-        .btn-container { text-align: center; margin: 28px 0; }
-        .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
-        .expiry-warning { color: #b91c1c; font-weight: 700; font-size: 12px; margin-top: 14px; text-align: center; }
-        .footer { background: #f8fafc; padding: 20px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
-        .privacy-note { background: #fffbeb; border: 1px solid #fcd34d; border-radius: 10px; padding: 10px 12px; margin-top: 18px; color: #92400e; font-size: 12px; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header">
-          <h1 class="title">SurgiTrack <span style="color: #2dd4bf;">iLog</span></h1>
-          <span class="badge">Professional Surgical Training & Clinical Portfolio</span>
-        </div>
-        <div class="content">
-          <div class="greeting">Dear ${displayName},</div>
-          ${introParagraph}
-          <div class="alert-box">
-            \u{1F512} <strong>Strict Surgical Security Policy:</strong> This verification link is strictly single-use and will expire in <strong>30 seconds</strong> from dispatch for security compliance.
-          </div>
-          <div class="btn-container">
-            <a href="${verificationUrl}" class="btn">Verify SurgiTrack Account</a>
-            <div class="expiry-warning">\u{23F1} Expires in 30 seconds \u2022 Single Use Only</div>
-          </div>
-          <div class="privacy-note">
-            \u{1F6E1} <strong>Privacy Notice:</strong> This link was sent exclusively to your registered email address. SurgiTrack will never display this link anywhere else, and our staff will never ask you to share it. If you did not request this email, you can safely ignore it.
-          </div>
-          <p style="font-size: 12px; color: #64748b; margin-top: 24px;">If the verification button does not work in your email client, please check your spam/junk folder or request a fresh link from the SurgiTrack app. The link is valid for 30 seconds only and can be used once.</p>
-        </div>
-        <div class="footer">
-          SurgiTrack iLog © 2026. Official Supervised Surgical Portfolio & Logbook System.
-        </div>
+  // Clean, minimal HTML body that matches the requested format exactly.
+  // The verification button is the only interactive element — the link URL
+  // is never rendered as plain text in the email body.
+  const mailHtml = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verify your SurgiTrack account</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
+    .container { max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; }
+    .header { background: #101C32; padding: 24px; text-align: center; border-bottom: 3px solid #0D9488; }
+    .title { color: #ffffff; font-size: 19px; font-weight: 800; margin: 0; }
+    .title .accent { color: #2dd4bf; }
+    .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.7; }
+    .greeting { font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 14px; }
+    .message { margin: 0 0 22px 0; color: #334155; }
+    .btn-container { text-align: center; margin: 26px 0; }
+    .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 36px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
+    .btn:hover { background: #0f766e; }
+    .meta { color: #94a3b8; font-size: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid #e2e8f0; }
+    .automated { color: #64748b; font-size: 12px; font-style: italic; margin-top: 16px; }
+    .footer { background: #f8fafc; padding: 18px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1 class="title">SurgiTrack <span class="accent">iLog</span></h1>
+    </div>
+    <div class="content">
+      <div class="greeting">Welcome to SurgiTrack iLog.</div>
+      <p class="message">Please verify your email address to activate your account.</p>
+      <div class="btn-container">
+        <a href="${verificationUrl}" class="btn">Verify Account</a>
       </div>
-    </body>
-    </html>
-  `;
+      <p class="automated">This is an automated security message.</p>
+      <div class="meta">
+        <strong>Security notice:</strong> This verification link is valid for 30 seconds and can only be used once. If you did not create a SurgiTrack account, you can safely ignore this email.
+      </div>
+    </div>
+    <div class="footer">
+      SurgiTrack iLog &mdash; Professional Surgical Training &amp; Clinical Portfolio
+    </div>
+  </div>
+</body>
+</html>`;
 
-  const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <security@surgitrack.app>';
+  // Plain-text fallback. The verification URL IS included here because
+  // plain-text clients cannot render the HTML button — without the URL,
+  // the recipient would have no way to verify. This text body is sent
+  // only inside the private SMTP email; it is never exposed in the UI
+  // or any API response.
+  const mailText = `Welcome to SurgiTrack iLog.
+
+Please verify your email address to activate your account.
+
+Open the following link in your browser to verify your account (valid for 30 seconds, single use):
+${verificationUrl}
+
+This is an automated security message.
+
+---
+SurgiTrack iLog - Professional Surgical Training & Clinical Portfolio
+If you did not create a SurgiTrack account, you can safely ignore this email.`;
+
+  // Sender address. Defaults to the product-owner-specified noreply@surgitrack.com
+  // when SMTP_FROM is not set. Real SMTP providers may rewrite this address to
+  // the authenticated sender if the noreply@surgitrack.com domain is not
+  // verified with the provider — see deployment notes in .env.example.
+  const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <noreply@surgitrack.com>';
 
   // Real SMTP dispatch — surfaces a thrown error on failure so the calling
   // endpoint can return a clear failure to the user without ever exposing
@@ -319,10 +343,7 @@ const dispatchVerificationEmail = async (
       to: toEmail,
       subject,
       html: mailHtml,
-      // Text body intentionally omitted — we do NOT want the verification URL
-      // to be echoed in plaintext mail previews or server-side mail logs.
-      // The HTML button is the primary CTA; recipients who cannot render HTML
-      // will still receive the email subject line and sender address.
+      text: mailText,
     });
     // Log ONLY delivery success + the recipient email. NEVER log the token or URL.
     console.log(`[SurgiTrack Mailer] Verification link dispatched to ${toEmail}`);
