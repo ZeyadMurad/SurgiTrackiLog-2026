@@ -1,0 +1,101 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return (isSignedIn() && request.auth.uid == userId);
+    }
+
+    function isSuperAdmin() {
+      return (isSignedIn() && request.auth.token.email == 'zeadmorud2030@gmail.com');
+    }
+
+    // User profiles & account registry
+    match /users/{userId} {
+      // Allow reading user profile and account initialization
+      allow get: if true;
+      allow list: if true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if isOwner(userId) || isSuperAdmin();
+
+      // Clinical cases
+      match /clinicalCases/{caseId} {
+        allow read, write: if true;
+      }
+
+      // Supervisors
+      match /supervisors/{supervisorId} {
+        allow read, write: if true;
+
+        match /trainingRecords/{recordId} {
+          allow read, write: if true;
+        }
+      }
+
+      match /trainingSessions/{sessionId} {
+        allow read, write: if true;
+      }
+
+      match /skills/{skillId} {
+        allow read, write: if true;
+      }
+
+      match /recommendations/{recommendationId} {
+        allow read, write: if true;
+      }
+
+      match /savedArticles/{articleId} {
+        allow read, write: if true;
+      }
+
+      match /backups/{backupId} {
+        allow read, write: if true;
+      }
+
+      match /notifications/{notificationId} {
+        allow read, write: if true;
+      }
+    }
+
+    // Shared Surgical Community Cases Feed
+    match /communityCases/{caseId} {
+      allow read, write: if true;
+    }
+
+    match /accounts/{accountId} {
+      allow read, write: if true;
+    }
+
+    match /deleted_users/{uid} {
+      allow read, write: if true;
+    }
+
+    match /notifications/{notificationId} {
+      allow read, write: if true;
+    }
+
+    match /notification_replies/{replyId} {
+      allow read, write: if true;
+    }
+
+    match /public/surgicalNews/{articleId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /system/settings {
+      allow read: if true;
+      allow write: if isSuperAdmin();
+    }
+  }
+}

@@ -1,0 +1,249 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile containing professional surgeon/trainee details.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 150 },
+        "email": { "type": "string", "maxLength": 150 },
+        "country": { "type": "string", "maxLength": 100 },
+        "medicalQualification": { "type": "string", "maxLength": 150 },
+        "currentPosition": { "type": "string", "maxLength": 100 },
+        "specialty": { "type": "string", "maxLength": 100 },
+        "hospitals": { "type": "string", "maxLength": 250 },
+        "biography": { "type": "string", "maxLength": 2000 },
+        "profilePhotoUrl": { "type": "string", "maxLength": 2048 },
+        "role": { "type": "string", "enum": ["normal_user", "super_admin"] },
+        "preferredLanguage": { "type": "string", "enum": ["en", "ar", "de"] },
+        "theme": { "type": "string", "enum": ["light", "dark", "system"] },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["userId", "fullName", "email"]
+    },
+    "ClinicalCase": {
+      "title": "ClinicalCase",
+      "description": "Anonymized clinical case record adhering strictly to patient privacy rules.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "caseReference": { "type": "string", "maxLength": 64 },
+        "patientAge": { "type": "number" },
+        "patientSex": { "type": "string", "enum": ["Male", "Female", "Other", "Undisclosed", ""] },
+        "presentationDate": { "type": "string", "maxLength": 30 },
+        "hospital": { "type": "string", "maxLength": 150 },
+        "department": { "type": "string", "maxLength": 150 },
+        "specialty": { "type": "string", "maxLength": 100 },
+        "chiefComplaint": { "type": "string", "maxLength": 500 },
+        "historyOfPresentIllness": { "type": "string", "maxLength": 3000 },
+        "durationOfSymptoms": { "type": "string", "maxLength": 100 },
+        "relevantMedicalHistory": { "type": "string", "maxLength": 2000 },
+        "surgicalHistory": { "type": "string", "maxLength": 2000 },
+        "drugHistory": { "type": "string", "maxLength": 1000 },
+        "allergies": { "type": "string", "maxLength": 500 },
+        "familyHistory": { "type": "string", "maxLength": 1000 },
+        "socialHistory": { "type": "string", "maxLength": 1000 },
+        "examination": { "type": "object" },
+        "investigations": { "type": "array" },
+        "primaryDiagnosis": { "type": "string", "maxLength": 200 },
+        "secondaryDiagnoses": { "type": "string", "maxLength": 500 },
+        "differentialDiagnosis": { "type": "string", "maxLength": 500 },
+        "icd10Code": { "type": "string", "maxLength": 50 },
+        "clinicalAssessment": { "type": "string", "maxLength": 2000 },
+        "management": { "type": "object" },
+        "surgicalProcedure": { "type": "object" },
+        "followUp": { "type": "object" },
+        "attachments": { "type": "array" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "caseReference", "presentationDate", "specialty", "primaryDiagnosis"]
+    },
+    "Supervisor": {
+      "title": "Supervisor",
+      "description": "Consultant or academic supervisor profile with independent logbook tracking.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "fullName": { "type": "string", "maxLength": 150 },
+        "academicDegree": { "type": "string", "maxLength": 100 },
+        "academicTitle": { "type": "string", "maxLength": 100 },
+        "professionalPosition": { "type": "string", "maxLength": 150 },
+        "specialty": { "type": "string", "maxLength": 100 },
+        "subspecialty": { "type": "string", "maxLength": 100 },
+        "department": { "type": "string", "maxLength": 150 },
+        "hospital": { "type": "string", "maxLength": 150 },
+        "university": { "type": "string", "maxLength": 150 },
+        "country": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 150 },
+        "additionalNotes": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "fullName", "professionalPosition", "specialty", "hospital"]
+    },
+    "TrainingRecord": {
+      "title": "TrainingRecord",
+      "description": "Supervised training and surgical procedure record belonging strictly to a supervisor.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "supervisorId": { "type": "string", "maxLength": 128 },
+        "trainingDate": { "type": "string", "maxLength": 30 },
+        "procedureDate": { "type": "string", "maxLength": 30 },
+        "hospital": { "type": "string", "maxLength": 150 },
+        "department": { "type": "string", "maxLength": 150 },
+        "specialty": { "type": "string", "maxLength": 100 },
+        "activityType": { "type": "string", "maxLength": 100 },
+        "procedureName": { "type": "string", "maxLength": 200 },
+        "clinicalCaseRef": { "type": "string", "maxLength": 64 },
+        "startTime": { "type": "string", "maxLength": 10 },
+        "endTime": { "type": "string", "maxLength": 10 },
+        "breakDurationMinutes": { "type": "number" },
+        "netTrainingHours": { "type": "number" },
+        "surgicalExposure": { "type": "string", "maxLength": 100 },
+        "participationRole": { "type": "string", "maxLength": 100 },
+        "participationGerman": { "type": "string", "maxLength": 150 },
+        "descriptionOfParticipation": { "type": "string", "maxLength": 2000 },
+        "responsibilities": { "type": "string", "maxLength": 1500 },
+        "surgicalTechniquesObserved": { "type": "string", "maxLength": 1500 },
+        "surgicalTechniquesPracticed": { "type": "string", "maxLength": 1500 },
+        "supervisionLevel": { "type": "string", "maxLength": 100 },
+        "skillsAcquired": { "type": "array" },
+        "learningPoints": { "type": "string", "maxLength": 1500 },
+        "supervisorFeedback": { "type": "string", "maxLength": 2000 },
+        "additionalNotes": { "type": "string", "maxLength": 1500 },
+        "verified": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "supervisorId", "trainingDate", "procedureName", "netTrainingHours"]
+    },
+    "TrainingSession": {
+      "title": "TrainingSession",
+      "description": "Precise training session for accurate hours tracking.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "supervisorId": { "type": "string", "maxLength": 128 },
+        "supervisorName": { "type": "string", "maxLength": 150 },
+        "hospital": { "type": "string", "maxLength": 150 },
+        "department": { "type": "string", "maxLength": 150 },
+        "trainingDate": { "type": "string", "maxLength": 30 },
+        "startTime": { "type": "string", "maxLength": 10 },
+        "endTime": { "type": "string", "maxLength": 10 },
+        "breakDurationMinutes": { "type": "number" },
+        "netTrainingHours": { "type": "number" },
+        "sessionType": { "type": "string", "maxLength": 100 },
+        "trainingActivities": { "type": "string", "maxLength": 1500 },
+        "skillsPracticed": { "type": "array" },
+        "notes": { "type": "string", "maxLength": 1500 },
+        "verified": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "trainingDate", "startTime", "endTime", "netTrainingHours"]
+    },
+    "UserSkill": {
+      "title": "UserSkill",
+      "description": "Cumulative surgical skill item in the user's competency matrix.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 150 },
+        "nameGerman": { "type": "string", "maxLength": 150 },
+        "specialty": { "type": "string", "maxLength": 100 },
+        "category": { "type": "string", "maxLength": 100 },
+        "exposureLevel": { "type": "string", "enum": ["Observed", "Assisted", "Performed Specific Steps Under Direct Supervision", "Performed Under Direct Supervision", "Assessed by Supervisor"] },
+        "competencyStatus": { "type": "string", "enum": ["Not Yet Assessed", "Learning", "Practicing", "Supervisor Assessed", "Competency Confirmed"] },
+        "totalRecordedSessions": { "type": "number" },
+        "totalDocumentedHours": { "type": "number" },
+        "lastPracticedDate": { "type": "string", "maxLength": 30 },
+        "supervisors": { "type": "array" },
+        "hospitals": { "type": "array" },
+        "feedbackNotes": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "name", "specialty"]
+    },
+    "Recommendation": {
+      "title": "Recommendation",
+      "description": "Generated or drafted supervisor recommendation letter.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "supervisorId": { "type": "string", "maxLength": 128 },
+        "supervisorName": { "type": "string", "maxLength": 150 },
+        "language": { "type": "string", "enum": ["en", "de", "ar"] },
+        "title": { "type": "string", "maxLength": 200 },
+        "letterDate": { "type": "string", "maxLength": 30 },
+        "recipient": { "type": "string", "maxLength": 300 },
+        "content": { "type": "string", "maxLength": 15000 },
+        "status": { "type": "string", "enum": ["draft", "finalized"] },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "supervisorId", "content"]
+    },
+    "SavedArticle": {
+      "title": "SavedArticle",
+      "description": "Bookmarked medical journal or international surgical news article.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 300 },
+        "url": { "type": "string", "maxLength": 1024 },
+        "publisher": { "type": "string", "maxLength": 150 },
+        "category": { "type": "string", "maxLength": 100 },
+        "publishedDate": { "type": "string", "maxLength": 50 },
+        "summary": { "type": "string", "maxLength": 2000 },
+        "savedAt": { "type": "string" }
+      },
+      "required": ["id", "userId", "title", "url"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "Private surgeon/trainee user profile."
+    },
+    "/users/{userId}/clinicalCases/{caseId}": {
+      "schema": "ClinicalCase",
+      "description": "Subcollection of anonymous clinical cases logged by the user."
+    },
+    "/users/{userId}/supervisors/{supervisorId}": {
+      "schema": "Supervisor",
+      "description": "Subcollection of independent supervisor profiles registered by the user."
+    },
+    "/users/{userId}/supervisors/{supervisorId}/trainingRecords/{recordId}": {
+      "schema": "TrainingRecord",
+      "description": "Supervised surgical training records strictly tied to a supervisor."
+    },
+    "/users/{userId}/trainingSessions/{sessionId}": {
+      "schema": "TrainingSession",
+      "description": "Precise documented training attendance sessions."
+    },
+    "/users/{userId}/skills/{skillId}": {
+      "schema": "UserSkill",
+      "description": "Cumulative surgical skills matrix."
+    },
+    "/users/{userId}/recommendations/{recommendationId}": {
+      "schema": "Recommendation",
+      "description": "Drafted recommendation letters for the user."
+    },
+    "/users/{userId}/savedArticles/{articleId}": {
+      "schema": "SavedArticle",
+      "description": "Saved and bookmarked surgical literature."
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "name": "SurgiTrack iLog ",
+  "description": "Comprehensive surgical training logbook, supervisor evaluations, clinical portfolio, and academic literature.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
