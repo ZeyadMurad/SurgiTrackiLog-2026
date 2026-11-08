@@ -4,10 +4,17 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
 
-dotenv.config();
-
+// Load environment variables.
+// Priority (highest first):
+//   1. `.env.local` — local development secrets (gitignored, NEVER committed)
+//   2. `.env`       — defaults / AI Studio runtime injection
+// dotenv does not overwrite variables that are already set in the process
+// environment, so deployment platforms (Vercel / Cloud Run / AI Studio
+// Secrets panel) always win.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, '.env.local') });
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 
 const app = express();
 const port = process.env.PORT || 3000;
