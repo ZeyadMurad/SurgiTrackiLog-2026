@@ -111,12 +111,12 @@ export const AuthView: React.FC = () => {
     } catch (err: any) {
       if (err.message === 'EMAIL_VERIFICATION_REQUIRED') {
         setMode('verify_link_sent');
-        setVerificationTimer(30);
-        setCanResendLink(false);
+        setVerificationTimer(0);
+        setCanResendLink(true);
         setSuccessMessage(
           isRTL
-            ? `بريدك الإلكتروني (${email}) غير مؤكد بعد. تم إرسال رابط تأكيد صالح لمدة 30 ثانية إلى بريدك.`
-            : `Your email (${email}) is pending verification. Please click the verification link sent to your inbox.`
+            ? `بريدك الإلكتروني (${email}) غير مؤكد بعد. اضغط على "إعادة إرسال رابط تأكيد جديد" بالأسفل لتصلك رسالة تحقق جديدة على بريدك فقط — لن يظهر الرابط في هذه الواجهة أبداً.`
+            : `Your email (${email}) is not yet verified. Click "Resend Verification Link" below to receive a fresh verification link in your inbox only — the link will never appear in this interface.`
         );
       } else {
         setErrorMessage(err.message || 'Authentication failed. Please verify credentials.');
@@ -174,8 +174,8 @@ export const AuthView: React.FC = () => {
       setMode('verify_link_sent');
       setSuccessMessage(
         isRTL
-          ? `تم إنشاء حسابك بنجاح! تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني (${email}). يرجى النقر على الرابط خلال 30 ثانية لتفعيل الحساب.`
-          : `Your account has been created. A verification link has been sent to your registered email address (${email}). Please open the link within 30 seconds to activate your account.`
+          ? `تم إنشاء حسابك بنجاح! تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني (${email}) فقط — لن يظهر الرابط في هذه الواجهة. يرجى فتح بريدك والنقر على الرابط خلال 30 ثانية لتفعيل الحساب.`
+          : `Your account has been created. A verification link has been sent PRIVATELY to your registered email address (${email}) only — it will never appear in this interface. Please open your inbox and click the link within 30 seconds to activate your account.`
       );
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to complete registration.');
@@ -195,8 +195,8 @@ export const AuthView: React.FC = () => {
       setCanResendLink(false);
       setSuccessMessage(
         isRTL
-          ? 'تم إرسال رابط تأكيد جديد بنجاح إلى بريدك الإلكتروني! صلاحية الرابط 30 ثانية.'
-          : 'A fresh verification link has been dispatched to your email! Valid for 30 seconds.'
+          ? 'تم إرسال رابط تأكيد جديد بنجاح إلى بريدك الإلكتروني فقط! صلاحية الرابط 30 ثانية. لن يظهر الرابط في هذه الواجهة.'
+          : 'A fresh verification link has been dispatched PRIVATELY to your email only! Valid for 30 seconds. The link will never be displayed in this interface.'
       );
     } catch (err: any) {
       setErrorMessage(err.message || 'Failed to resend verification link.');
@@ -717,12 +717,21 @@ export const AuthView: React.FC = () => {
                   </div>
                   <p className="leading-relaxed text-slate-700">
                     {isRTL
-                      ? 'تم إنشاء حسابك بنجاح. تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني المسجل. يرجى فتح البريد والنقر على الرابط خلال 30 ثانية لتفعيل حسابك والدخول إلى المحفظة الجراحية:'
-                      : 'Your account has been created. A verification link has been sent directly to your registered email address. Please open the link within 30 seconds to activate your account:'}
+                      ? 'تم إنشاء حسابك بنجاح. تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني المسجل فقط. يرجى فتح البريد والنقر على الرابط خلال 30 ثانية لتفعيل حسابك والدخول إلى المحفظة الجراحية:'
+                      : 'Your account has been created. A verification link has been sent directly to your registered email address only. Please open the link within 30 seconds to activate your account:'}
                   </p>
                   <div className="bg-white p-2.5 rounded-xl border border-teal-200/80 flex items-center gap-2 text-slate-800 font-mono font-bold text-xs">
                     <Mail size={15} className="text-teal-600 shrink-0" />
                     <span className="truncate">{email}</span>
+                  </div>
+                  {/* Strict privacy reminder — verification URLs and tokens are NEVER shown here */}
+                  <div className="flex items-start gap-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xl p-2.5 mt-1">
+                    <ShieldCheck size={14} className="text-amber-700 shrink-0 mt-0.5" />
+                    <span className="leading-snug">
+                      {isRTL
+                        ? 'لأسباب أمنية صارمة: رابط التحقق موجود فقط داخل رسالة البريد الإلكتروني المرسلة إلى بريدك. لن يظهر الرابط أو الرمز في هذه الواجهة، ولن يطلبه منك أي عضو في فريق SurgiTrack أبداً. تحقق من مجلد الرسائل غير المرغوب فيها (Spam) إذا لم تجد الرسالة في صندوق الوارد.'
+                        : 'For strict security: the verification link exists ONLY inside the email sent to your inbox. SurgiTrack will NEVER display the link or token in this interface, and our staff will NEVER ask you to share it. Check your spam/junk folder if you do not see it in your inbox.'}
+                    </span>
                   </div>
                 </div>
 

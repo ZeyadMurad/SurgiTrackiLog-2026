@@ -54,7 +54,6 @@ export const AddSurgicalSkillModal: React.FC<AddSurgicalSkillModalProps> = ({
     }
   }, [specialty]);
 
-  const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   if (!isOpen) return null;

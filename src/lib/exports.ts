@@ -440,19 +440,43 @@ export function exportSupervisorPDF(payload: Partial<SupervisorPortfolioPayload>
   doc.setFontSize(8.5);
   doc.setFont('helvetica', 'normal');
   doc.text(`Qualification: ${trainee.medicalQualification} | Position: ${trainee.currentPosition} | Email: ${trainee.email}`, 14, 42);
-  doc.text(`Supervising Surgeon: ${supervisor.academicDegree || ''} ${supervisor.academicTitle || ''} ${supervisor.fullName} • ${supervisor.professionalPosition}`, 14, 47);
-  doc.text(`Institution: ${supervisor.department}, ${supervisor.hospital}, ${supervisor.country} | Email: ${supervisor.email || 'N/A'}`, 14, 52);
+
+  // === Supervisor Professional Details Block (Requirement 1: Restore supervisor selection) ===
+  // Explicitly displays the individual supervisor's professional credentials, hospital,
+  // department, specialty, university, country, and email — so the exported portfolio
+  // is unambiguously attributed to the single selected supervisor.
+  doc.setFontSize(9.5);
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(13, 148, 136); // Teal accent for the supervisor header
+  doc.text(`Supervising Surgeon: ${supervisor.academicTitle || ''} ${supervisor.academicDegree || ''} ${supervisor.fullName}`.replace(/\s+/g, ' ').trim(), 14, 48);
+
+  doc.setFontSize(8.5);
+  doc.setFont('helvetica', 'normal');
+  doc.setTextColor(30, 41, 59);
+  doc.text(`Professional Position: ${supervisor.professionalPosition}`, 14, 53);
+  doc.text(`Specialty: ${supervisor.specialty}${supervisor.subspecialty ? ` (Subspecialty: ${supervisor.subspecialty})` : ''}`, 14, 58);
+  doc.text(`Department: ${supervisor.department}`, 14, 63);
+  doc.text(`Hospital / Institution: ${supervisor.hospital}`, 14, 68);
+  if (supervisor.university) {
+    doc.text(`University / Affiliation: ${supervisor.university}`, 14, 73);
+  }
+  doc.text(`Country: ${supervisor.country}  |  Contact Email: ${supervisor.email || 'N/A'}`, 14, supervisor.university ? 78 : 73);
+
+  // Portfolio metrics line — placed below the supervisor block
+  const metricsY = supervisor.university ? 84 : 79;
+  doc.setFontSize(8);
+  doc.setTextColor(71, 85, 105);
   doc.text(
     `Portfolio Metrics: ${cases.length} Cases | ${records.length} Operations | Net Hours: ${totalHours.toFixed(1)}h (Verified: ${verifiedHours.toFixed(1)}h) | ${skills.length} Skills`,
     14,
-    57
+    metricsY
   );
 
   // SECTION 1: Clinical Cases under this supervisor
   doc.setFontSize(10);
   doc.setFont('helvetica', 'bold');
   doc.setTextColor(13, 148, 136); // Teal #0D9488
-  doc.text('1. Supervised Clinical Cases Logbook', 14, 64);
+  doc.text('1. Supervised Clinical Cases Logbook', 14, metricsY + 7);
 
   const caseTableData = cases.slice(0, 15).map(c => [
     c.caseReference,
@@ -464,7 +488,7 @@ export function exportSupervisorPDF(payload: Partial<SupervisorPortfolioPayload>
   ]);
 
   autoTable(doc, {
-    startY: 67,
+    startY: metricsY + 10,
     head: [['Case Ref', 'Date', 'Primary Diagnosis', 'Procedure', 'Role', 'Hospital']],
     body: caseTableData.length > 0 ? caseTableData : [['No clinical cases recorded under this supervisor.', '', '', '', '', '']],
     headStyles: { fillColor: [13, 148, 136], textColor: 255 },

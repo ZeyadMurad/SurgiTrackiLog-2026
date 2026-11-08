@@ -19,6 +19,9 @@ import {
   Eye,
   Check,
   X,
+  Mail,
+  GraduationCap,
+  Stethoscope,
 } from 'lucide-react';
 import { useData } from '../context/DataContext';
 import { useAuth } from '../context/AuthContext';
@@ -85,6 +88,66 @@ export const SupervisorView: React.FC = () => {
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
+
+  // === Supervisor Selection-First Export Modal (Requirement 1) ===
+  // Forces explicit supervisor selection BEFORE any PDF/Excel/Word export.
+  // The active supervisor is preselected, but the user MUST confirm the
+  // individual supervisor whose records, hours, hospital, and professional
+  // details will be exported. Only that supervisor's strictly-isolated
+  // data is forwarded to the existing PDF design.
+  const [showExportSelectModal, setShowExportSelectModal] = useState(false);
+  const [pendingExportFormat, setPendingExportFormat] = useState<'pdf' | 'xlsx' | 'docx' | null>(null);
+  const [exportTargetSupId, setExportTargetSupId] = useState<string>('');
+
+  const openExportSelector = (format: 'pdf' | 'xlsx' | 'docx') => {
+    if (!profile || supervisors.length === 0) return;
+    setPendingExportFormat(format);
+    // Preselect the currently active supervisor — but the user must confirm.
+    setExportTargetSupId(activeSupervisor?.id || supervisors[0]?.id || '');
+    setShowExportSelectModal(true);
+  };
+
+  const confirmAndExport = () => {
+    if (!profile || !pendingExportFormat || !exportTargetSupId) return;
+    const targetSupervisor = supervisors.find(s => s.id === exportTargetSupId);
+    if (!targetSupervisor) return;
+
+    // Strictly filter records/sessions/cases/skills for THIS individual supervisor only
+    const tRecords = trainingRecords.filter(r => r.supervisorId === targetSupervisor.id);
+    const tSessions = trainingSessions.filter(s => s.supervisorId === targetSupervisor.id);
+    const tCases = cases.filter(c => {
+      if (c.supervisorId) return c.supervisorId === targetSupervisor.id;
+      return supervisors[0]?.id === targetSupervisor.id;
+    });
+    const tSkills = skills.filter(s => {
+      if (s.supervisorId) return s.supervisorId === targetSupervisor.id;
+      if (s.supervisors && s.supervisors.includes(targetSupervisor.fullName)) return true;
+      return supervisors[0]?.id === targetSupervisor.id;
+    });
+
+    const payload = {
+      trainee: profile,
+      supervisor: targetSupervisor,
+      records: tRecords,
+      sessions: tSessions,
+      skills: tSkills,
+      cases: tCases,
+    };
+
+    if (pendingExportFormat === 'xlsx') exportSupervisorExcel(payload);
+    else if (pendingExportFormat === 'docx') exportSupervisorWord(payload);
+    else exportSupervisorPDF(payload);
+
+    // Reset modal state
+    setShowExportSelectModal(false);
+    setPendingExportFormat(null);
+    setExportTargetSupId('');
+  };
+
+  const handleExport = (format: 'xlsx' | 'docx' | 'pdf') => {
+    // Always restore & require explicit supervisor selection before exporting
+    openExportSelector(format);
+  };
 
   const handleConfirmDelete = async () => {
     if (!deleteTarget) return;
@@ -167,22 +230,33 @@ export const SupervisorView: React.FC = () => {
   ).length;
   const progressionPercent = totalSupervisorSkills > 0 ? Math.round((confirmedSkillsCount / totalSupervisorSkills) * 100) : 0;
 
-  const handleExport = (format: 'xlsx' | 'docx' | 'pdf') => {
-    if (!profile || !activeSupervisor) return;
-    const payload = {
-      trainee: profile,
-      supervisor: activeSupervisor,
-      records: supRecords,
-      sessions: supSessions,
-      skills: supSkills,
-    };
-
-    if (format === 'xlsx') exportSupervisorExcel(payload);
-    else if (format === 'docx') exportSupervisorWord(payload);
-    else exportSupervisorPDF(payload);
-  };
-
   const caseRefs = Array.from(new Set(cases.map(c => c.caseReference).filter(Boolean)));
+
+  // Preview metrics for the currently selected export target supervisor
+  const exportTargetSupervisor = supervisors.find(s => s.id === exportTargetSupId);
+  const previewRecords = exportTargetSupervisor
+    ? trainingRecords.filter(r => r.supervisorId === exportTargetSupervisor.id)
+    : [];
+  const previewSessions = exportTargetSupervisor
+    ? trainingSessions.filter(s => s.supervisorId === exportTargetSupervisor.id)
+    : [];
+  const previewCases = exportTargetSupervisor
+    ? cases.filter(c => {
+        if (c.supervisorId) return c.supervisorId === exportTargetSupervisor.id;
+        return supervisors[0]?.id === exportTargetSupervisor.id;
+      })
+    : [];
+  const previewSkills = exportTargetSupervisor
+    ? skills.filter(s => {
+        if (s.supervisorId) return s.supervisorId === exportTargetSupervisor.id;
+        if (s.supervisors && s.supervisors.includes(exportTargetSupervisor.fullName)) return true;
+        return supervisors[0]?.id === exportTargetSupervisor.id;
+      })
+    : [];
+  const previewRecordsHours = previewRecords.reduce((sum, r) => sum + (Number(r.netTrainingHours) || 0), 0) +
+    previewSessions.reduce((sum, s) => sum + (Number(s.netTrainingHours) || 0), 0);
+  const previewSkillsHours = previewSkills.reduce((sum, s) => sum + (Number(s.totalDocumentedHours) || 0), 0);
+  const previewTotalHours = previewRecordsHours + previewSkillsHours;
 
   return (
     <div className="space-y-6">
@@ -248,6 +322,20 @@ export const SupervisorView: React.FC = () => {
                 title={isRTL ? `حذف المشرف ${sup.fullName} نهائياً` : `Delete supervisor ${sup.fullName}`}
               >
                 <Trash2 size={13} />
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  // Per-supervisor quick PDF export — opens the selection-first modal preselected with THIS supervisor
+                  if (!profile) return;
+                  setPendingExportFormat('pdf');
+                  setExportTargetSupId(sup.id);
+                  setShowExportSelectModal(true);
+                }}
+                className="p-1 rounded-lg text-slate-400 hover:text-teal-700 hover:bg-teal-50 transition cursor-pointer"
+                title={isRTL ? `تصدير ملف PDF لهذا المشرف فقط` : `Export this supervisor\u2019s PDF portfolio only`}
+              >
+                <FileText size={13} />
               </button>
             </div>
           );
@@ -996,6 +1084,200 @@ export const SupervisorView: React.FC = () => {
                 )}
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* === Supervisor Selection-First Export Modal (Requirement 1) === */}
+      {showExportSelectModal && pendingExportFormat && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-3xl max-w-2xl w-full p-6 space-y-5 shadow-2xl border border-slate-200 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-start justify-between pb-3 border-b border-slate-100">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <FileText size={18} className="text-teal-600" />
+                  {isRTL ? 'تصدير ملف مشرف محدد' : 'Export Individual Supervisor Portfolio'}
+                </h3>
+                <p className="text-xs text-slate-500 mt-1">
+                  {isRTL
+                    ? 'اختر المشرف الذي تريد تصدير سجلاته وساعاته ومستشفاه وتفاصيله الاحترافية فقط.'
+                    : 'Select the individual supervisor whose records, hours, hospital, and professional details you want to export.'}
+                </p>
+              </div>
+              <button
+                onClick={() => {
+                  setShowExportSelectModal(false);
+                  setPendingExportFormat(null);
+                  setExportTargetSupId('');
+                }}
+                className="p-1 rounded-xl hover:bg-slate-100 text-slate-500 cursor-pointer"
+              >
+                <X size={18} />
+              </button>
+            </div>
+
+            {/* Format hint */}
+            <div className="text-[11px] font-bold uppercase tracking-wide text-slate-500 flex items-center gap-2">
+              {pendingExportFormat === 'pdf' && <><FileText size={13} className="text-red-600" /> PDF Portfolio (.pdf)</>}
+              {pendingExportFormat === 'xlsx' && <><FileSpreadsheet size={13} className="text-teal-600" /> Excel Workbook (.xlsx)</>}
+              {pendingExportFormat === 'docx' && <><FileText size={13} className="text-blue-600" /> Word Document (.docx)</>}
+            </div>
+
+            {/* Supervisor selection list */}
+            <div className="space-y-2">
+              <label className="block text-xs font-bold text-slate-700">
+                {isRTL ? 'اختر المشرف:' : 'Select Supervisor:'}
+              </label>
+              <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
+                {supervisors.map((sup) => {
+                  const isSelected = exportTargetSupId === sup.id;
+                  const recCount = trainingRecords.filter(r => r.supervisorId === sup.id).length;
+                  return (
+                    <button
+                      key={sup.id}
+                      type="button"
+                      onClick={() => setExportTargetSupId(sup.id)}
+                      className={`w-full text-left p-3 rounded-2xl border-2 transition cursor-pointer flex items-start gap-3 ${
+                        isSelected
+                          ? 'border-[#0D9488] bg-teal-50/60 shadow-xs'
+                          : 'border-slate-200 bg-white hover:border-slate-300 hover:bg-slate-50/60'
+                      }`}
+                    >
+                      <div className={`w-9 h-9 rounded-xl flex items-center justify-center font-bold text-xs shrink-0 ${
+                        isSelected ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-600'
+                      }`}>
+                        {sup.fullName.substring(0, 2).toUpperCase()}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-sm font-bold text-slate-900 truncate">
+                            {sup.academicTitle ? `${sup.academicTitle} ` : ''}{sup.fullName}
+                          </span>
+                          {sup.academicDegree && (
+                            <span className="text-[10px] bg-slate-100 text-slate-700 font-mono px-1.5 py-0.5 rounded">
+                              {sup.academicDegree}
+                            </span>
+                          )}
+                          {isSelected && (
+                            <CheckCircle2 size={14} className="text-teal-600 shrink-0" />
+                          )}
+                        </div>
+                        <p className="text-[11px] text-slate-600 mt-0.5 truncate">
+                          {sup.professionalPosition} • {sup.specialty}
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-0.5 flex items-center gap-1 truncate">
+                          <Building size={11} className="shrink-0" />
+                          <span className="truncate">{sup.department}, {sup.hospital}, {sup.country}</span>
+                        </p>
+                        <span className="text-[10px] text-slate-500 mt-1 inline-block bg-slate-100 px-2 py-0.5 rounded-full font-mono">
+                          {recCount} operations logged
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Live preview of what will be exported for the selected supervisor */}
+            {exportTargetSupervisor && (
+              <div className="bg-slate-50 rounded-2xl border border-slate-200 p-4 space-y-3">
+                <div className="flex items-center gap-2 text-xs font-bold text-slate-700">
+                  <Sparkles size={13} className="text-teal-600" />
+                  <span>{isRTL ? 'معاينة ما سيتم تصديره:' : 'What will be exported:'}</span>
+                </div>
+
+                {/* Professional details */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
+                  <div className="flex items-center gap-1.5 text-slate-700">
+                    <UserCheck size={12} className="text-slate-400 shrink-0" />
+                    <span className="font-semibold truncate">
+                      {exportTargetSupervisor.academicDegree || ''} {exportTargetSupervisor.fullName}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-700">
+                    <Stethoscope size={12} className="text-slate-400 shrink-0" />
+                    <span className="truncate">{exportTargetSupervisor.professionalPosition}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-700">
+                    <GraduationCap size={12} className="text-slate-400 shrink-0" />
+                    <span className="truncate">{exportTargetSupervisor.specialty}{exportTargetSupervisor.subspecialty ? ` • ${exportTargetSupervisor.subspecialty}` : ''}</span>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-slate-700">
+                    <Building size={12} className="text-slate-400 shrink-0" />
+                    <span className="truncate">{exportTargetSupervisor.department}, {exportTargetSupervisor.hospital}</span>
+                  </div>
+                  {exportTargetSupervisor.university && (
+                    <div className="flex items-center gap-1.5 text-slate-700">
+                      <GraduationCap size={12} className="text-slate-400 shrink-0" />
+                      <span className="truncate">{exportTargetSupervisor.university}</span>
+                    </div>
+                  )}
+                  {exportTargetSupervisor.email && (
+                    <div className="flex items-center gap-1.5 text-slate-700">
+                      <Mail size={12} className="text-slate-400 shrink-0" />
+                      <span className="truncate">{exportTargetSupervisor.email}</span>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-1.5 text-slate-700">
+                    <Building size={12} className="text-slate-400 shrink-0" />
+                    <span className="truncate">{exportTargetSupervisor.country}</span>
+                  </div>
+                </div>
+
+                {/* Metrics */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-2 border-t border-slate-200">
+                  <div className="text-center">
+                    <div className="text-[9px] uppercase font-bold text-slate-500">Cases</div>
+                    <div className="text-sm font-bold text-slate-900">{previewCases.length}</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-[9px] uppercase font-bold text-slate-500">Operations</div>
+                    <div className="text-sm font-bold text-slate-900">{previewRecords.length}</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-[9px] uppercase font-bold text-slate-500">Skills</div>
+                    <div className="text-sm font-bold text-slate-900">{previewSkills.length}</div>
+                  </div>
+                  <div className="text-center">
+                    <div className="text-[9px] uppercase font-bold text-slate-500">Total Hours</div>
+                    <div className="text-sm font-bold text-teal-700">{previewTotalHours.toFixed(1)}h</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Action buttons */}
+            <div className="flex items-center gap-3 pt-2">
+              <button
+                onClick={() => {
+                  setShowExportSelectModal(false);
+                  setPendingExportFormat(null);
+                  setExportTargetSupId('');
+                }}
+                className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-700 font-bold text-xs hover:bg-slate-50 cursor-pointer"
+              >
+                {isRTL ? 'إلغاء' : 'Cancel'}
+              </button>
+              <button
+                onClick={confirmAndExport}
+                disabled={!exportTargetSupId}
+                className="flex-1 py-2.5 rounded-xl bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs shadow-md transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Download size={14} />
+                <span>
+                  {isRTL
+                    ? `تصدير ملف ${pendingExportFormat.toUpperCase()}`
+                    : `Export ${pendingExportFormat.toUpperCase()} Portfolio`}
+                </span>
+              </button>
+            </div>
+
+            <p className="text-[10px] text-slate-400 text-center pt-1">
+              {isRTL
+                ? 'سيتم تصدير سجلات وساعات وتفاصيل المشرف المحدد فقط، باستخدام تصميم PDF الحالي.'
+                : 'Only the selected supervisor\u2019s records, hours, and professional details will be exported using the existing PDF design.'}
+            </p>
           </div>
         </div>
       )}

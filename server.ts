@@ -129,9 +129,17 @@ Context focus: ${contextType || 'General Surgical Terminology & Translation'}. T
 // STRICT SERVER-SIDE EMAIL VERIFICATION SYSTEM
 // Real Clickable Verification Links • 30-Second Server-Enforced Expiration • Single-Use Security
 // NO OTP • NO Codes in UI • Real Email Delivery via Nodemailer
+// SECURITY INVARIANTS (must never be violated):
+//   1. Verification URLs and tokens are NEVER returned in any API response body.
+//   2. Verification URLs and tokens are NEVER logged to the console or any log stream.
+//   3. Verification URLs and tokens are NEVER rendered in the client UI.
+//   4. The only channel through which a token reaches the user is the SMTP email
+//      sent to the exact registered email address.
+//   5. Each token strictly expires 30 seconds after creation (server-clock enforced).
+//   6. Each token is single-use and immediately invalidated after the first click.
 // ==========================================
 
-import nodemailer from 'nodemailer';
+import nodemailer, { Transporter } from 'nodemailer';
 import crypto from 'crypto';
 
 interface VerificationTokenRecord {
@@ -144,6 +152,7 @@ interface VerificationTokenRecord {
 }
 
 // In-memory token store: Map<token, VerificationTokenRecord>
+// The token string is the ONLY key — never serialized to disk, never logged.
 const verificationTokens = new Map<string, VerificationTokenRecord>();
 
 // Verified emails registry (pre-verify known super admins)
@@ -152,7 +161,9 @@ const verifiedEmailRegistry = new Set<string>([
   'zeadmorud1999@gmail.com',
 ]);
 
-// Determine App URL for verification links
+// Determine App URL for verification links (URL is composed server-side and
+// only ever leaves the server inside the private SMTP email — never returned
+// to the HTTP client and never written to logs).
 const getAppBaseUrl = (req: express.Request): string => {
   if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
     return process.env.APP_URL.replace(/\/$/, '');
@@ -162,8 +173,34 @@ const getAppBaseUrl = (req: express.Request): string => {
   return `${protocol}://${host}`;
 };
 
-// Create Nodemailer Transporter
-const createMailTransporter = () => {
+// ==========================================
+// REAL SMTP EMAIL INFRASTRUCTURE
+// ==========================================
+// Verifies that real SMTP credentials are present. The application MUST NOT
+// silently fall back to a no-op transport: doing so would give a false sense
+// of "verification link sent" while no email was ever delivered — which would
+// defeat the entire purpose of private, real email verification.
+const isSmtpConfigured = (): boolean => {
+  if (process.env.SMTP_PROVIDER === 'gmail') {
+    return !!(process.env.SMTP_USER && process.env.SMTP_PASS);
+  }
+  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+};
+
+// Create Nodemailer Transporter — REAL SMTP ONLY, no jsonTransport fallback.
+const createMailTransporter = (): Transporter => {
+  // Option B: Gmail convenience transport
+  if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    return nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+    });
+  }
+
+  // Option A: Generic SMTP transport
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
     return nodemailer.createTransport({
       host: process.env.SMTP_HOST,
@@ -176,15 +213,125 @@ const createMailTransporter = () => {
     });
   }
 
-  // Fallback to standard SMTP / JSON transport if custom SMTP credentials are not yet populated
-  return nodemailer.createTransport({
-    jsonTransport: true,
-  });
+  // No SMTP credentials configured — this is a hard misconfiguration.
+  // Return a transport that will explicitly reject every sendMail call so
+  // the calling endpoint surfaces a clear "SMTP not configured" error to
+  // the user instead of silently swallowing the failure.
+  console.error('[SurgiTrack Mailer] CRITICAL: SMTP credentials are not configured. Set SMTP_HOST/SMTP_USER/SMTP_PASS (or SMTP_PROVIDER=gmail) — see .env.example. Real email delivery is unavailable until configured.');
+  return {
+    sendMail: async (): Promise<any> => {
+      throw new Error('SMTP_NOT_CONFIGURED');
+    },
+  } as any;
 };
 
 const mailTransporter = createMailTransporter();
 
+// Emit a one-time startup diagnostic about SMTP readiness (no tokens, no PII).
+if (!isSmtpConfigured()) {
+  console.warn('[SurgiTrack Mailer] WARNING: Real email delivery is disabled. Configure SMTP_* env vars — see .env.example. Verification links cannot be dispatched until SMTP is configured.');
+} else {
+  console.log('[SurgiTrack Mailer] Real SMTP delivery infrastructure is configured and ready.');
+}
+
+// Shared helper: dispatch the verification email to the EXACT registered email.
+// Returns true on successful delivery, throws on failure. NEVER returns the
+// token or URL — those stay strictly server-side.
+const dispatchVerificationEmail = async (
+  toEmail: string,
+  displayName: string,
+  verificationUrl: string,
+  isResend: boolean
+): Promise<void> => {
+  const subject = isResend
+    ? 'New Verification Link for Your SurgiTrack Account (30 Seconds)'
+    : 'Verify Your SurgiTrack iLog Account (Valid for 30 Seconds)';
+
+  const introParagraph = isResend
+    ? '<p>A new email verification link has been requested for your SurgiTrack iLog account.</p>'
+    : '<p>Thank you for registering your clinical portfolio with <strong>SurgiTrack iLog</strong>. To ensure the authenticity of surgical trainee accounts and safeguard confidential medical records, please verify your email address by clicking the link below.</p>';
+
+  const mailHtml = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
+        .container { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
+        .header { background: #101C32; padding: 28px 24px; text-align: center; border-bottom: 3px solid #0D9488; }
+        .title { color: #ffffff; font-size: 20px; font-weight: 800; margin: 0; }
+        .badge { color: #5eead4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-top: 4px; display: block; }
+        .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.6; }
+        .greeting { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
+        .alert-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px; padding: 14px; margin: 18px 0; color: #166534; font-size: 13px; }
+        .btn-container { text-align: center; margin: 28px 0; }
+        .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
+        .expiry-warning { color: #b91c1c; font-weight: 700; font-size: 12px; margin-top: 14px; text-align: center; }
+        .footer { background: #f8fafc; padding: 20px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
+        .privacy-note { background: #fffbeb; border: 1px solid #fcd34d; border-radius: 10px; padding: 10px 12px; margin-top: 18px; color: #92400e; font-size: 12px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h1 class="title">SurgiTrack <span style="color: #2dd4bf;">iLog</span></h1>
+          <span class="badge">Professional Surgical Training & Clinical Portfolio</span>
+        </div>
+        <div class="content">
+          <div class="greeting">Dear ${displayName},</div>
+          ${introParagraph}
+          <div class="alert-box">
+            \u{1F512} <strong>Strict Surgical Security Policy:</strong> This verification link is strictly single-use and will expire in <strong>30 seconds</strong> from dispatch for security compliance.
+          </div>
+          <div class="btn-container">
+            <a href="${verificationUrl}" class="btn">Verify SurgiTrack Account</a>
+            <div class="expiry-warning">\u{23F1} Expires in 30 seconds \u2022 Single Use Only</div>
+          </div>
+          <div class="privacy-note">
+            \u{1F6E1} <strong>Privacy Notice:</strong> This link was sent exclusively to your registered email address. SurgiTrack will never display this link anywhere else, and our staff will never ask you to share it. If you did not request this email, you can safely ignore it.
+          </div>
+          <p style="font-size: 12px; color: #64748b; margin-top: 24px;">If the verification button does not work in your email client, please check your spam/junk folder or request a fresh link from the SurgiTrack app. The link is valid for 30 seconds only and can be used once.</p>
+        </div>
+        <div class="footer">
+          SurgiTrack iLog © 2026. Official Supervised Surgical Portfolio & Logbook System.
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <security@surgitrack.app>';
+
+  // Real SMTP dispatch — surfaces a thrown error on failure so the calling
+  // endpoint can return a clear failure to the user without ever exposing
+  // the token or the verification URL.
+  try {
+    await mailTransporter.sendMail({
+      from: fromAddress,
+      to: toEmail,
+      subject,
+      html: mailHtml,
+      // Text body intentionally omitted — we do NOT want the verification URL
+      // to be echoed in plaintext mail previews or server-side mail logs.
+      // The HTML button is the primary CTA; recipients who cannot render HTML
+      // will still receive the email subject line and sender address.
+    });
+    // Log ONLY delivery success + the recipient email. NEVER log the token or URL.
+    console.log(`[SurgiTrack Mailer] Verification link dispatched to ${toEmail}`);
+  } catch (mailErr: any) {
+    // NEVER log the verification URL or token — only the error message string.
+    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
+    console.warn(`[SurgiTrack Mailer] Real mail delivery FAILED for ${toEmail}: ${safeErr}`);
+    throw mailErr;
+  }
+};
+
 // Endpoint: Send Real Verification Link (30-second expiration)
+// SECURITY: This endpoint NEVER returns the token or verification URL in the
+// response body. The only delivery channel for the link is the private SMTP
+// email sent to the exact registered email address. If SMTP delivery fails,
+// we return a clear error so the user can retry — never a false "success".
 app.post('/api/auth/send-verification-link', async (req, res) => {
   const { email, fullName } = req.body;
   if (!email || typeof email !== 'string' || !email.includes('@')) {
@@ -194,7 +341,14 @@ app.post('/api/auth/send-verification-link', async (req, res) => {
   const cleanEmail = email.trim().toLowerCase();
   const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
 
-  // Invalidate any existing unused tokens for this email
+  // Hard requirement: real SMTP delivery infrastructure must be configured.
+  if (!isSmtpConfigured()) {
+    return res.status(503).json({
+      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure SMTP before registering.',
+    });
+  }
+
+  // Invalidate any existing unused tokens for this email (only one active link per email)
   for (const [t, rec] of verificationTokens.entries()) {
     if (rec.email === cleanEmail && !rec.used) {
       verificationTokens.delete(t);
@@ -217,70 +371,34 @@ app.post('/api/auth/send-verification-link', async (req, res) => {
 
   verificationTokens.set(token, record);
 
+  // Compose the verification URL — STRICTLY server-side. This URL is never
+  // returned in the HTTP response and is never written to logs. It only
+  // leaves the server inside the private SMTP email below.
   const baseUrl = getAppBaseUrl(req);
   const verificationUrl = `${baseUrl}/api/auth/verify-link?token=${token}`;
 
-  // Compose professional clinical email
-  const mailHtml = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
-        .container { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-        .header { background: #101C32; padding: 28px 24px; text-align: center; border-bottom: 3px solid #0D9488; }
-        .title { color: #ffffff; font-size: 20px; font-weight: 800; margin: 0; }
-        .badge { color: #5eead4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-top: 4px; display: block; }
-        .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.6; }
-        .greeting { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
-        .alert-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px; padding: 14px; margin: 18px 0; color: #166534; font-size: 13px; }
-        .btn-container { text-align: center; margin: 28px 0; }
-        .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
-        .expiry-warning { color: #b91c1c; font-weight: 700; font-size: 12px; margin-top: 14px; text-align: center; }
-        .footer { background: #f8fafc; padding: 20px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header">
-          <h1 class="title">SurgiTrack <span style="color: #2dd4bf;">iLog</span></h1>
-          <span class="badge">Professional Surgical Training & Clinical Portfolio</span>
-        </div>
-        <div class="content">
-          <div class="greeting">Dear ${displayName},</div>
-          <p>Thank you for registering your clinical portfolio with <strong>SurgiTrack iLog</strong>. To ensure the authenticity of surgical trainee accounts and safeguard confidential medical records, please verify your email address by clicking the link below.</p>
-          <div class="alert-box">
-            🔒 <strong>Strict Surgical Security Policy:</strong> This verification link is strictly single-use and will expire in <strong>30 seconds</strong> from dispatch for security compliance.
-          </div>
-          <div class="btn-container">
-            <a href="${verificationUrl}" class="btn">Verify SurgiTrack Account</a>
-            <div class="expiry-warning">⏱ Expires in 30 seconds • Single Use Only</div>
-          </div>
-          <p style="font-size: 12px; color: #64748b; margin-top: 24px;">If you did not register for a SurgiTrack iLog account, you can safely ignore this email.</p>
-        </div>
-        <div class="footer">
-          SurgiTrack iLog © 2026. Official Supervised Surgical Portfolio & Logbook System.
-        </div>
-      </div>
-    </body>
-    </html>
-  `;
-
+  // Dispatch the real SMTP email to the EXACT registered address.
+  // On failure we MUST invalidate the freshly-created token so it cannot
+  // be brute-forced later, and we MUST return a clear error to the user
+  // (without ever exposing the token).
   try {
-    const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <security@surgitrack.app>';
-    await mailTransporter.sendMail({
-      from: fromAddress,
-      to: cleanEmail,
-      subject: 'Verify Your SurgiTrack iLog Account (Valid for 30 Seconds)',
-      html: mailHtml,
-    });
-    console.log(`[SurgiTrack Mailer] Verification link dispatched to ${cleanEmail}`);
+    await dispatchVerificationEmail(cleanEmail, displayName, verificationUrl, false);
   } catch (mailErr: any) {
-    console.warn(`[SurgiTrack Mailer] Real mail delivery note:`, mailErr.message);
+    // Invalidate the token — never leave a "live" token if its delivery failed.
+    verificationTokens.delete(token);
+
+    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
+    if (safeErr === 'SMTP_NOT_CONFIGURED') {
+      return res.status(503).json({
+        error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
+      });
+    }
+    return res.status(502).json({
+      error: 'We could not deliver the verification email at this time. Please wait a moment and try again.',
+    });
   }
 
-  // Return success without EVER exposing the token or URL in response
+  // Return success — without EVER exposing the token or URL in the response.
   return res.json({
     success: true,
     message: 'Verification link sent directly to your registered email address.',
@@ -391,7 +509,14 @@ app.post('/api/auth/resend-verification', async (req, res) => {
   const cleanEmail = email.trim().toLowerCase();
   const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
 
-  // Invalidate any existing unused tokens for this email
+  // Hard requirement: real SMTP delivery infrastructure must be configured.
+  if (!isSmtpConfigured()) {
+    return res.status(503).json({
+      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure SMTP.',
+    });
+  }
+
+  // Invalidate any existing unused tokens for this email (only one active link per email)
   for (const [t, rec] of verificationTokens.entries()) {
     if (rec.email === cleanEmail && !rec.used) {
       verificationTokens.delete(t);
@@ -400,7 +525,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 
   const token = crypto.randomBytes(32).toString('hex');
   const now = Date.now();
-  const expiresAt = now + 30 * 1000;
+  const expiresAt = now + 30 * 1000; // STRICT 30 SECONDS
 
   const record: VerificationTokenRecord = {
     token,
@@ -413,66 +538,31 @@ app.post('/api/auth/resend-verification', async (req, res) => {
 
   verificationTokens.set(token, record);
 
+  // Verification URL composed STRICTLY server-side. Never returned in the
+  // HTTP response, never logged. Only embedded inside the private SMTP email.
   const baseUrl = getAppBaseUrl(req);
   const verificationUrl = `${baseUrl}/api/auth/verify-link?token=${token}`;
 
-  const mailHtml = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="utf-8">
-      <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
-        .container { max-width: 560px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }
-        .header { background: #101C32; padding: 28px 24px; text-align: center; border-bottom: 3px solid #0D9488; }
-        .title { color: #ffffff; font-size: 20px; font-weight: 800; margin: 0; }
-        .badge { color: #5eead4; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-weight: 700; margin-top: 4px; display: block; }
-        .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.6; }
-        .greeting { font-size: 16px; font-weight: 700; color: #0f172a; margin-bottom: 12px; }
-        .alert-box { background: #f0fdf4; border: 1px solid #86efac; border-radius: 12px; padding: 14px; margin: 18px 0; color: #166534; font-size: 13px; }
-        .btn-container { text-align: center; margin: 28px 0; }
-        .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 32px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
-        .expiry-warning { color: #b91c1c; font-weight: 700; font-size: 12px; margin-top: 14px; text-align: center; }
-        .footer { background: #f8fafc; padding: 20px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <div class="header">
-          <h1 class="title">SurgiTrack <span style="color: #2dd4bf;">iLog</span></h1>
-          <span class="badge">Professional Surgical Training & Clinical Portfolio</span>
-        </div>
-        <div class="content">
-          <div class="greeting">Dear ${displayName},</div>
-          <p>A new email verification link has been requested for your SurgiTrack iLog account.</p>
-          <div class="alert-box">
-            ⏱ <strong>Strict 30-Second Expiration:</strong> Please click the button below within <strong>30 seconds</strong>.
-          </div>
-          <div class="btn-container">
-            <a href="${verificationUrl}" class="btn">Verify SurgiTrack Account</a>
-            <div class="expiry-warning">⏱ Expires in 30 seconds • Single Use Only</div>
-          </div>
-        </div>
-        <div class="footer">
-          SurgiTrack iLog © 2026. Official Supervised Surgical Portfolio.
-        </div>
-      </div>
-    </body>
-    </html>
-  `;
-
+  // Dispatch via real SMTP — surface failure as a clear error (never the token).
   try {
-    const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <security@surgitrack.app>';
-    await mailTransporter.sendMail({
-      from: fromAddress,
-      to: cleanEmail,
-      subject: 'New Verification Link for Your SurgiTrack Account (30 Seconds)',
-      html: mailHtml,
+    await dispatchVerificationEmail(cleanEmail, displayName, verificationUrl, true);
+  } catch (mailErr: any) {
+    // Invalidate the freshly-created token — never leave a "live" token if
+    // its delivery failed.
+    verificationTokens.delete(token);
+
+    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
+    if (safeErr === 'SMTP_NOT_CONFIGURED') {
+      return res.status(503).json({
+        error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
+      });
+    }
+    return res.status(502).json({
+      error: 'We could not deliver the verification email at this time. Please wait a moment and try again.',
     });
-  } catch (err: any) {
-    console.warn('[SurgiTrack Mailer] Resend warning:', err.message);
   }
 
+  // Return success — without EVER exposing the token or URL in the response.
   return res.json({
     success: true,
     message: 'A fresh verification link has been sent to your registered email address.',
