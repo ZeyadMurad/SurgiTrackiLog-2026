@@ -181,65 +181,99 @@ const getAppBaseUrl = (req: express.Request): string => {
 };
 
 // ==========================================
-// REAL SMTP EMAIL INFRASTRUCTURE
+// EMAIL DELIVERY INFRASTRUCTURE
 // ==========================================
-// Verifies that real SMTP credentials are present. The application MUST NOT
-// silently fall back to a no-op transport: doing so would give a false sense
-// of "verification link sent" while no email was ever delivered — which would
-// defeat the entire purpose of private, real email verification.
-const isSmtpConfigured = (): boolean => {
-  if (process.env.SMTP_PROVIDER === 'gmail') {
-    return !!(process.env.SMTP_USER && process.env.SMTP_PASS);
-  }
-  return !!(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS);
+// Supports two delivery modes:
+//   1. HTTP API (Resend) — REQUIRED on Render free tier, which blocks
+//      outbound SMTP connections (ports 25/465/587 all time out).
+//      Set RESEND_API_KEY to enable. Free tier: 3000 emails/month.
+//      Sign up at https://resend.com (no credit card required).
+//   2. SMTP (Nodemailer) — works on local dev, paid Render, Vercel,
+//      Cloud Run, etc. Set SMTP_PROVIDER/SMTP_HOST/SMTP_USER/SMTP_PASS.
+//      Does NOT work on Render free tier due to outbound SMTP blocking.
+//
+// SECURITY: Verification URLs and tokens are NEVER returned in any API
+// response body, NEVER written to server logs, and NEVER rendered in
+// the client UI. The only delivery channel is the email itself.
+
+// Determine which email delivery mode is configured.
+const getEmailMode = (): 'resend' | 'smtp' | 'none' => {
+  if (process.env.RESEND_API_KEY) return 'resend';
+  if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
+  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
+  return 'none';
 };
 
-// Create Nodemailer Transporter — REAL SMTP ONLY, no jsonTransport fallback.
-const createMailTransporter = (): Transporter => {
-  // Option B: Gmail convenience transport
+const isEmailConfigured = (): boolean => getEmailMode() !== 'none';
+
+// Create Nodemailer Transporter for SMTP mode (local dev / paid hosting).
+// Only created when needed to avoid startup errors when using HTTP API mode.
+let mailTransporter: Transporter | null = null;
+const getSmtpTransporter = (): Transporter => {
+  if (mailTransporter) return mailTransporter;
+
   if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    return nodemailer.createTransport({
+    mailTransporter = nodemailer.createTransport({
       service: 'gmail',
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
+    return mailTransporter;
   }
 
-  // Option A: Generic SMTP transport
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    return nodemailer.createTransport({
+    mailTransporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: Number(process.env.SMTP_PORT) || 587,
       secure: process.env.SMTP_SECURE === 'true' || Number(process.env.SMTP_PORT) === 465,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
+    return mailTransporter;
   }
 
-  // No SMTP credentials configured — this is a hard misconfiguration.
-  // Return a transport that will explicitly reject every sendMail call so
-  // the calling endpoint surfaces a clear "SMTP not configured" error to
-  // the user instead of silently swallowing the failure.
-  console.error('[SurgiTrack Mailer] CRITICAL: SMTP credentials are not configured. Set SMTP_HOST/SMTP_USER/SMTP_PASS (or SMTP_PROVIDER=gmail) — see .env.example. Real email delivery is unavailable until configured.');
-  return {
-    sendMail: async (): Promise<any> => {
-      throw new Error('SMTP_NOT_CONFIGURED');
-    },
-  } as any;
+  throw new Error('SMTP_NOT_CONFIGURED');
 };
 
-const mailTransporter = createMailTransporter();
+// Send email via Resend HTTP API — works on Render free tier (no SMTP needed).
+const sendViaResend = async (
+  fromAddress: string,
+  toEmail: string,
+  subject: string,
+  html: string,
+  text: string
+): Promise<void> => {
+  const apiKey = process.env.RESEND_API_KEY!;
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: fromAddress,
+      to: [toEmail],
+      subject,
+      html,
+      text,
+    }),
+  });
 
-// Emit a one-time startup diagnostic about SMTP readiness (no tokens, no PII).
-if (!isSmtpConfigured()) {
-  console.warn('[SurgiTrack Mailer] WARNING: Real email delivery is disabled. Configure SMTP_* env vars — see .env.example. Verification links cannot be dispatched until SMTP is configured.');
-} else {
-  console.log('[SurgiTrack Mailer] Real SMTP delivery infrastructure is configured and ready.');
-}
+  if (!response.ok) {
+    const errText = await response.text().catch(() => 'unknown error');
+    throw new Error(`Resend API error (${response.status}): ${errText.substring(0, 200)}`);
+  }
+};
+
+// Emit a one-time startup diagnostic about email readiness.
+(() => {
+  const mode = getEmailMode();
+  if (mode === 'resend') {
+    console.log('[SurgiTrack Mailer] Resend HTTP API is configured and ready. (Render free-tier compatible)');
+  } else if (mode === 'smtp') {
+    console.log('[SurgiTrack Mailer] SMTP delivery is configured. NOTE: SMTP does NOT work on Render free tier — use RESEND_API_KEY instead.');
+  } else {
+    console.warn('[SurgiTrack Mailer] WARNING: No email delivery configured. Set RESEND_API_KEY (recommended for Render) or SMTP_* env vars — see .env.example.');
+  }
+})();
 
 // Shared helper: dispatch the verification email to the EXACT registered email.
 // Returns true on successful delivery, throws on failure. NEVER returns the
@@ -328,25 +362,32 @@ This is an automated security message.
 SurgiTrack iLog - Professional Surgical Training & Clinical Portfolio
 If you did not create a SurgiTrack account, you can safely ignore this email.`;
 
-  // Sender address. Defaults to the product-owner-specified noreply@surgitrack.com
-  // when SMTP_FROM is not set. Real SMTP providers may rewrite this address to
-  // the authenticated sender if the noreply@surgitrack.com domain is not
-  // verified with the provider — see deployment notes in .env.example.
+  // Sender address. When using Resend with a verified domain, this can be
+  // noreply@surgitrack.com. On the Resend free tier (no domain verified),
+  // use onboarding@resend.dev. Override via SMTP_FROM env var.
   const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <noreply@surgitrack.com>';
 
-  // Real SMTP dispatch — surfaces a thrown error on failure so the calling
-  // endpoint can return a clear failure to the user without ever exposing
-  // the token or the verification URL.
+  // Dispatch via the configured delivery mode (Resend HTTP API or SMTP).
+  // Surfaces a thrown error on failure so the calling endpoint can return
+  // a clear failure to the user without ever exposing the token or URL.
   try {
-    await mailTransporter.sendMail({
-      from: fromAddress,
-      to: toEmail,
-      subject,
-      html: mailHtml,
-      text: mailText,
-    });
+    const mode = getEmailMode();
+    if (mode === 'resend') {
+      await sendViaResend(fromAddress, toEmail, subject, mailHtml, mailText);
+    } else if (mode === 'smtp') {
+      const transporter = getSmtpTransporter();
+      await transporter.sendMail({
+        from: fromAddress,
+        to: toEmail,
+        subject,
+        html: mailHtml,
+        text: mailText,
+      });
+    } else {
+      throw new Error('EMAIL_NOT_CONFIGURED');
+    }
     // Log ONLY delivery success + the recipient email. NEVER log the token or URL.
-    console.log(`[SurgiTrack Mailer] Verification link dispatched to ${toEmail}`);
+    console.log(`[SurgiTrack Mailer] Verification link dispatched to ${toEmail} via ${mode}`);
   } catch (mailErr: any) {
     // NEVER log the verification URL or token — only the error message string.
     const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
@@ -369,10 +410,10 @@ app.post('/api/auth/send-verification-link', async (req, res) => {
   const cleanEmail = email.trim().toLowerCase();
   const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
 
-  // Hard requirement: real SMTP delivery infrastructure must be configured.
-  if (!isSmtpConfigured()) {
+  // Hard requirement: email delivery must be configured (Resend or SMTP).
+  if (!isEmailConfigured()) {
     return res.status(503).json({
-      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure SMTP before registering.',
+      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure RESEND_API_KEY or SMTP credentials.',
     });
   }
 
@@ -416,7 +457,7 @@ app.post('/api/auth/send-verification-link', async (req, res) => {
     verificationTokens.delete(token);
 
     const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
-    if (safeErr === 'SMTP_NOT_CONFIGURED') {
+    if (safeErr === 'SMTP_NOT_CONFIGURED' || safeErr === 'EMAIL_NOT_CONFIGURED') {
       return res.status(503).json({
         error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
       });
@@ -537,10 +578,10 @@ app.post('/api/auth/resend-verification', async (req, res) => {
   const cleanEmail = email.trim().toLowerCase();
   const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
 
-  // Hard requirement: real SMTP delivery infrastructure must be configured.
-  if (!isSmtpConfigured()) {
+  // Hard requirement: email delivery must be configured (Resend or SMTP).
+  if (!isEmailConfigured()) {
     return res.status(503).json({
-      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure SMTP.',
+      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
     });
   }
 
@@ -580,7 +621,7 @@ app.post('/api/auth/resend-verification', async (req, res) => {
     verificationTokens.delete(token);
 
     const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
-    if (safeErr === 'SMTP_NOT_CONFIGURED') {
+    if (safeErr === 'SMTP_NOT_CONFIGURED' || safeErr === 'EMAIL_NOT_CONFIGURED') {
       return res.status(503).json({
         error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
       });
