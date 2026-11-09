@@ -88,6 +88,17 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // Email verification registry — persists across server restarts.
+    // Publicly readable so the client can check verification status without
+    // relying on the server's in-memory registry (which is lost on every
+    // Render free-tier restart). Publicly writable because the client only
+    // writes AFTER the server confirms verification via the /verify-link
+    // endpoint — the document contains only { verified: true, verifiedAt }.
+    match /verified_emails/{email} {
+      allow read: if true;
+      allow write: if true;
+    }
+
     match /public/surgicalNews/{articleId} {
       allow read: if true;
       allow write: if false;

@@ -257,8 +257,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const clean = emailParam.trim().toLowerCase();
         fetch(`/api/auth/verification-status?email=${encodeURIComponent(clean)}`)
           .then(res => res.json())
-          .then(data => {
+          .then(async (data) => {
             if (data.verified) {
+              // 1. Persist verification to Firestore so it survives server restarts
+              try {
+                await setDoc(doc(db, 'verified_emails', clean), {
+                  email: clean,
+                  verified: true,
+                  verifiedAt: new Date().toISOString(),
+                });
+              } catch (fsErr) {
+                console.warn('Could not persist verification to Firestore:', fsErr);
+              }
+
+              // 2. Update local account registry
               const accounts = getLocalAccounts();
               if (accounts[clean]) {
                 accounts[clean].profile.emailVerified = true;
@@ -270,6 +282,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 } as any);
                 setProfile(accounts[clean].profile);
                 localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(accounts[clean].profile));
+
+                // 3. Also update the Firestore user profile
+                try {
+                  await setDoc(doc(db, 'users', accounts[clean].uid), { emailVerified: true }, { merge: true });
+                } catch (e) {
+                  console.warn('Could not update Firestore user profile emailVerified flag:', e);
+                }
               }
               setUnverifiedEmail(null);
               // Clean up the URL query params without reloading the page
@@ -380,16 +399,39 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   };
 
-  // Check verification status from backend server
+  // Check verification status from backend server, with Firestore fallback.
+  // The server's in-memory registry is lost on every Render free-tier restart,
+  // so we also check the Firestore `verified_emails` collection which persists
+  // permanently. This ensures that users who verified their email before a
+  // server restart can still log in.
   const checkVerificationStatus = async (email: string): Promise<boolean> => {
+    const cleanEmail = email.trim().toLowerCase();
+
+    // 1. Check server in-memory registry first (fastest, most recent)
     try {
-      const res = await fetch(`/api/auth/verification-status?email=${encodeURIComponent(email)}`);
-      if (!res.ok) return false;
-      const data = await res.json();
-      return !!data.verified;
+      const res = await fetch(`/api/auth/verification-status?email=${encodeURIComponent(cleanEmail)}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.verified) return true;
+      }
     } catch {
-      return false;
+      // Server might be waking up (Render free-tier cold start) — fall through
     }
+
+    // 2. Check Firestore `verified_emails` collection (persists across restarts)
+    try {
+      const snap = await getDoc(doc(db, 'verified_emails', cleanEmail));
+      if (snap.exists()) {
+        const data = snap.data();
+        if (data.verified === true) {
+          return true;
+        }
+      }
+    } catch {
+      // Firestore might be temporarily unreachable — fall through
+    }
+
+    return false;
   };
 
   // Resend verification link
