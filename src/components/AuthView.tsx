@@ -178,7 +178,22 @@ export const AuthView: React.FC = () => {
           : `Your account has been created. A verification link has been sent PRIVATELY to your registered email address (${email}) only — it will never appear in this interface. Please open your inbox and click the link within 30 seconds to activate your account.`
       );
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to complete registration.');
+      if (err.message === 'EMAIL_SEND_FAILED') {
+        // Account WAS created successfully, but the verification email could
+        // not be dispatched right now. Route the user to the verification
+        // screen so they can retry via "Resend Verification Link" — never
+        // leave them stranded on the registration form.
+        setMode('verify_link_sent');
+        setVerificationTimer(0);
+        setCanResendLink(true);
+        setErrorMessage(
+          isRTL
+            ? `تم إنشاء حسابك بنجاح، لكن تعذر إرسال بريد التحقق مؤقتاً. اضغط على "إعادة إرسال رابط تأكيد جديد" بالأسفل لتصلك رسالة التحقق على بريدك (${email}).`
+            : `Your account was created successfully, but we could not dispatch the verification email right now. Click "Resend Verification Link" below to receive the verification message at (${email}).`
+        );
+      } else {
+        setErrorMessage(err.message || 'Failed to complete registration.');
+      }
     } finally {
       setLoading(false);
     }

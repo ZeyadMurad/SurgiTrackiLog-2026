@@ -183,21 +183,26 @@ const getAppBaseUrl = (req: express.Request): string => {
 // ==========================================
 // EMAIL DELIVERY INFRASTRUCTURE
 // ==========================================
-// Supports two delivery modes:
-//   1. HTTP API (Resend) — REQUIRED on Render free tier, which blocks
-//      outbound SMTP connections (ports 25/465/587 all time out).
-//      Set RESEND_API_KEY to enable. Free tier: 3000 emails/month.
-//      Sign up at https://resend.com (no credit card required).
-//   2. SMTP (Nodemailer) — works on local dev, paid Render, Vercel,
+// Supports three delivery modes (priority order):
+//   1. Brevo HTTP API — RECOMMENDED for Render free tier. 300 emails/day,
+//      sends to ANY recipient address (no domain verification needed).
+//      Set BREVO_API_KEY to enable. Sign up at https://www.brevo.com
+//      (free, no credit card). Get API key from SMTP & API settings.
+//   2. Resend HTTP API — also works on Render free tier (HTTPS), BUT the
+//      free tier without a verified domain only allows sending to the
+//      account owner's own email address. To send to all recipients,
+//      verify a domain at resend.com/domains. Set RESEND_API_KEY.
+//   3. SMTP (Nodemailer) — works on local dev, paid Render, Vercel,
 //      Cloud Run, etc. Set SMTP_PROVIDER/SMTP_HOST/SMTP_USER/SMTP_PASS.
-//      Does NOT work on Render free tier due to outbound SMTP blocking.
+//      Does NOT work on Render free tier (outbound SMTP ports blocked).
 //
 // SECURITY: Verification URLs and tokens are NEVER returned in any API
 // response body, NEVER written to server logs, and NEVER rendered in
 // the client UI. The only delivery channel is the email itself.
 
-// Determine which email delivery mode is configured.
-const getEmailMode = (): 'resend' | 'smtp' | 'none' => {
+// Determine which email delivery mode is configured (priority order).
+const getEmailMode = (): 'brevo' | 'resend' | 'smtp' | 'none' => {
+  if (process.env.BREVO_API_KEY) return 'brevo';
   if (process.env.RESEND_API_KEY) return 'resend';
   if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
   if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
@@ -206,8 +211,18 @@ const getEmailMode = (): 'resend' | 'smtp' | 'none' => {
 
 const isEmailConfigured = (): boolean => getEmailMode() !== 'none';
 
+// Parse a "Display Name <email@domain>" formatted address into its parts.
+// Used by the Brevo API which requires sender as separate name/email fields.
+const parseFromAddress = (fromAddress: string): { name: string; email: string } => {
+  const match = fromAddress.match(/^\s*"?([^"<]*)"?\s*<([^>]+)>\s*$/);
+  if (match) {
+    return { name: match[1].trim() || 'SurgiTrack Verification', email: match[2].trim() };
+  }
+  return { name: 'SurgiTrack Verification', email: fromAddress.trim() };
+};
+
 // Create Nodemailer Transporter for SMTP mode (local dev / paid hosting).
-// Only created when needed to avoid startup errors when using HTTP API mode.
+// Only created when needed to avoid startup errors when using HTTP API modes.
 let mailTransporter: Transporter | null = null;
 const getSmtpTransporter = (): Transporter => {
   if (mailTransporter) return mailTransporter;
@@ -233,7 +248,42 @@ const getSmtpTransporter = (): Transporter => {
   throw new Error('SMTP_NOT_CONFIGURED');
 };
 
-// Send email via Resend HTTP API — works on Render free tier (no SMTP needed).
+// Send email via Brevo HTTP API — works on Render free tier (HTTPS, not blocked).
+// Free tier: 300 emails/day, sends to ANY recipient (unlike Resend free tier
+// which restricts sending to the account owner's own email only).
+const sendViaBrevo = async (
+  fromAddress: string,
+  toEmail: string,
+  subject: string,
+  html: string,
+  text: string
+): Promise<void> => {
+  const sender = parseFromAddress(fromAddress);
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY!,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { name: sender.name, email: sender.email },
+      to: [{ email: toEmail }],
+      subject,
+      htmlContent: html,
+      textContent: text,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => 'unknown error');
+    throw new Error(`Brevo API error (${response.status}): ${errText.substring(0, 200)}`);
+  }
+};
+
+// Send email via Resend HTTP API — works on Render free tier (HTTPS, not blocked).
+// NOTE: the Resend free tier without a verified domain only permits sending
+// to the account owner's own email address.
 const sendViaResend = async (
   fromAddress: string,
   toEmail: string,
@@ -266,12 +316,14 @@ const sendViaResend = async (
 // Emit a one-time startup diagnostic about email readiness.
 (() => {
   const mode = getEmailMode();
-  if (mode === 'resend') {
-    console.log('[SurgiTrack Mailer] Resend HTTP API is configured and ready. (Render free-tier compatible)');
+  if (mode === 'brevo') {
+    console.log('[SurgiTrack Mailer] Brevo HTTP API is configured and ready. (Render free-tier compatible, sends to any recipient)');
+  } else if (mode === 'resend') {
+    console.log('[SurgiTrack Mailer] Resend HTTP API is configured. NOTE: Resend free tier only sends to the account owner\'s own email — use BREVO_API_KEY to send to all recipients.');
   } else if (mode === 'smtp') {
-    console.log('[SurgiTrack Mailer] SMTP delivery is configured. NOTE: SMTP does NOT work on Render free tier — use RESEND_API_KEY instead.');
+    console.log('[SurgiTrack Mailer] SMTP delivery is configured. NOTE: SMTP does NOT work on Render free tier — use BREVO_API_KEY instead.');
   } else {
-    console.warn('[SurgiTrack Mailer] WARNING: No email delivery configured. Set RESEND_API_KEY (recommended for Render) or SMTP_* env vars — see .env.example.');
+    console.warn('[SurgiTrack Mailer] WARNING: No email delivery configured. Set BREVO_API_KEY (recommended — sends to any recipient) or RESEND_API_KEY or SMTP_* env vars — see .env.example.');
   }
 })();
 
@@ -367,12 +419,14 @@ If you did not create a SurgiTrack account, you can safely ignore this email.`;
   // use onboarding@resend.dev. Override via SMTP_FROM env var.
   const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <noreply@surgitrack.com>';
 
-  // Dispatch via the configured delivery mode (Resend HTTP API or SMTP).
+  // Dispatch via the configured delivery mode (Brevo, Resend HTTP API, or SMTP).
   // Surfaces a thrown error on failure so the calling endpoint can return
   // a clear failure to the user without ever exposing the token or URL.
   try {
     const mode = getEmailMode();
-    if (mode === 'resend') {
+    if (mode === 'brevo') {
+      await sendViaBrevo(fromAddress, toEmail, subject, mailHtml, mailText);
+    } else if (mode === 'resend') {
       await sendViaResend(fromAddress, toEmail, subject, mailHtml, mailText);
     } else if (mode === 'smtp') {
       const transporter = getSmtpTransporter();

@@ -664,13 +664,27 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     if (!isVerified) {
-      // Send real verification link to exact registered email with 30s expiration
-      await sendVerificationLink(cleanEmail, newProfile.fullName);
+      // Send real verification link to the exact registered email with 30s expiration.
+      // STRICT GATE: the user is NOT signed in until they click the verification
+      // link — setUser(null)/setProfile(null) below block all app access.
+      //
+      // If the email dispatch itself fails (e.g. transient provider outage), the
+      // account is ALREADY persisted (localStorage + Firestore above), so we
+      // still route the user to the verification screen where they can retry
+      // via "Resend Verification Link" — instead of failing the entire
+      // registration and leaving an orphaned, unusable account.
       setUnverifiedEmail(cleanEmail);
-      // Strictly prevent access to protected app features until verified
       setUser(null);
       setProfile(null);
       localStorage.removeItem(LOCAL_PROFILE_KEY);
+
+      try {
+        await sendVerificationLink(cleanEmail, newProfile.fullName);
+      } catch (sendErr: any) {
+        // Signal to the UI that the account was created but delivery failed.
+        // The UI transitions to the verification screen with a retry option.
+        throw new Error('EMAIL_SEND_FAILED');
+      }
       return;
     }
 
