@@ -50,13 +50,6 @@ interface AuthContextType {
   getAllRegisteredUsers: () => Promise<UserProfile[]>;
   adminDeleteUserAccount: (userId: string) => Promise<void>;
 
-  // Real Email Verification Link Workflow (30s Server Expiration, No OTP)
-  sendVerificationLink: (email: string, fullName?: string) => Promise<{ success: boolean; expiresInSeconds: number }>;
-  checkVerificationStatus: (email: string) => Promise<boolean>;
-  resendVerificationLink: (email: string, fullName?: string) => Promise<{ success: boolean; expiresInSeconds: number }>;
-  unverifiedEmail: string | null;
-  setUnverifiedEmail: (email: string | null) => void;
-
   // Real-time Admin Deletion Lockout
   accountDeletedByAdmin: boolean;
   dismissDeletedAccountModal: () => void;
@@ -168,9 +161,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Real-time admin deletion lockout state
   const [accountDeletedByAdmin, setAccountDeletedByAdmin] = useState(false);
 
-  // Unverified email pending state for strict verification screen
-  const [unverifiedEmail, setUnverifiedEmail] = useState<string | null>(null);
-
   // Notifications and replies state
   const [notifications, setNotifications] = useState<AppNotification[]>(getLocalNotifications());
   const [notificationReplies, setNotificationReplies] = useState<NotificationReply[]>(getLocalReplies());
@@ -245,61 +235,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
 
     return () => unsubscribe();
-  }, []);
-
-  // Listen for verification link redirect: /?verified=true&email=...
-  useEffect(() => {
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const isVerifiedParam = params.get('verified') === 'true';
-      const emailParam = params.get('email');
-      if (isVerifiedParam && emailParam) {
-        const clean = emailParam.trim().toLowerCase();
-        fetch(`/api/auth/verification-status?email=${encodeURIComponent(clean)}`)
-          .then(res => res.json())
-          .then(async (data) => {
-            if (data.verified) {
-              // 1. Persist verification to Firestore so it survives server restarts
-              try {
-                await setDoc(doc(db, 'verified_emails', clean), {
-                  email: clean,
-                  verified: true,
-                  verifiedAt: new Date().toISOString(),
-                });
-              } catch (fsErr) {
-                console.warn('Could not persist verification to Firestore:', fsErr);
-              }
-
-              // 2. Update local account registry
-              const accounts = getLocalAccounts();
-              if (accounts[clean]) {
-                accounts[clean].profile.emailVerified = true;
-                saveLocalAccount(accounts[clean]);
-                setUser({
-                  uid: accounts[clean].uid,
-                  email: accounts[clean].email,
-                  displayName: accounts[clean].fullName,
-                } as any);
-                setProfile(accounts[clean].profile);
-                localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(accounts[clean].profile));
-
-                // 3. Also update the Firestore user profile
-                try {
-                  await setDoc(doc(db, 'users', accounts[clean].uid), { emailVerified: true }, { merge: true });
-                } catch (e) {
-                  console.warn('Could not update Firestore user profile emailVerified flag:', e);
-                }
-              }
-              setUnverifiedEmail(null);
-              // Clean up the URL query params without reloading the page
-              window.history.replaceState({}, document.title, window.location.pathname);
-            }
-          })
-          .catch(err => console.warn('Verification redirect handler note:', err));
-      }
-    } catch (e) {
-      console.warn('URL param parse error:', e);
-    }
   }, []);
 
   // Real-time listener for current user's profile deletion by admin
@@ -379,79 +314,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.warn('Could not attach notifications listeners:', e);
     }
   }, []);
-
-  // Send real verification link to user's email (30s server-enforced expiration)
-  const sendVerificationLink = async (email: string, fullName?: string) => {
-    const res = await fetch('/api/auth/send-verification-link', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, fullName }),
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to dispatch verification email.');
-    }
-
-    return {
-      success: true,
-      expiresInSeconds: data.expiresInSeconds || 30,
-    };
-  };
-
-  // Check verification status from backend server, with Firestore fallback.
-  // The server's in-memory registry is lost on every Render free-tier restart,
-  // so we also check the Firestore `verified_emails` collection which persists
-  // permanently. This ensures that users who verified their email before a
-  // server restart can still log in.
-  const checkVerificationStatus = async (email: string): Promise<boolean> => {
-    const cleanEmail = email.trim().toLowerCase();
-
-    // 1. Check server in-memory registry first (fastest, most recent)
-    try {
-      const res = await fetch(`/api/auth/verification-status?email=${encodeURIComponent(cleanEmail)}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.verified) return true;
-      }
-    } catch {
-      // Server might be waking up (Render free-tier cold start) — fall through
-    }
-
-    // 2. Check Firestore `verified_emails` collection (persists across restarts)
-    try {
-      const snap = await getDoc(doc(db, 'verified_emails', cleanEmail));
-      if (snap.exists()) {
-        const data = snap.data();
-        if (data.verified === true) {
-          return true;
-        }
-      }
-    } catch {
-      // Firestore might be temporarily unreachable — fall through
-    }
-
-    return false;
-  };
-
-  // Resend verification link
-  const resendVerificationLink = async (email: string, fullName?: string) => {
-    const res = await fetch('/api/auth/resend-verification', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, fullName }),
-    });
-
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Failed to resend verification link.');
-    }
-
-    return {
-      success: true,
-      expiresInSeconds: data.expiresInSeconds || 30,
-    };
-  };
 
   // Broadcast Notification to all users (strictly Admin)
   const broadcastNotification = async (notif: { title: string; message: string; category: AppNotification['category'] }) => {
@@ -617,7 +479,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     const isSuperAdmin = cleanEmail === SUPER_ADMIN_EMAIL || cleanEmail === 'zeadmorud1999@gmail.com';
-    const isVerified = isSuperAdmin;
 
     const newProfile: UserProfile = {
       userId: uid,
@@ -633,7 +494,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       role: isSuperAdmin ? 'super_admin' : 'normal_user',
       preferredLanguage: language,
       theme: 'light',
-      emailVerified: isVerified,
+      emailVerified: true,
       status: 'active',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -663,32 +524,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.warn('Saved account locally, queued for sync:', fsErr);
     }
 
-    if (!isVerified) {
-      // Send real verification link to the exact registered email with 30s expiration.
-      // STRICT GATE: the user is NOT signed in until they click the verification
-      // link — setUser(null)/setProfile(null) below block all app access.
-      //
-      // If the email dispatch itself fails (e.g. transient provider outage), the
-      // account is ALREADY persisted (localStorage + Firestore above), so we
-      // still route the user to the verification screen where they can retry
-      // via "Resend Verification Link" — instead of failing the entire
-      // registration and leaving an orphaned, unusable account.
-      setUnverifiedEmail(cleanEmail);
-      setUser(null);
-      setProfile(null);
-      localStorage.removeItem(LOCAL_PROFILE_KEY);
-
-      try {
-        await sendVerificationLink(cleanEmail, newProfile.fullName);
-      } catch (sendErr: any) {
-        // Signal to the UI that the account was created but delivery failed.
-        // The UI transitions to the verification screen with a retry option.
-        throw new Error('EMAIL_SEND_FAILED');
-      }
-      return;
-    }
-
-    // Super admin pre-verified bypass
+    // Registration completes the session immediately — the account is fully
+    // activated on creation. Subsequent sign-ins use email + password only,
+    // and a mismatch of either is rejected by Firebase Auth / the stored hash.
     setProfile(newProfile);
     localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(newProfile));
   };
@@ -722,6 +560,36 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (fbErr.message?.includes('إدارة الموقع') || fbErr.message?.includes('deleted')) {
         throw fbErr;
       }
+      // Map Firebase Auth error codes to clear, localized rejection messages.
+      const code = fbErr?.code || '';
+      if (
+        code === 'auth/invalid-credential' ||
+        code === 'auth/wrong-password' ||
+        code === 'auth/user-not-found' ||
+        code === 'auth/invalid-login-credentials'
+      ) {
+        throw new Error(
+          language === 'ar'
+            ? 'البريد الإلكتروني أو كلمة المرور غير صحيحة. يرجى التحقق من بيانات الدخول والمحاولة مجدداً.'
+            : language === 'de'
+            ? 'E-Mail-Adresse oder Passwort ist falsch. Bitte überprüfen Sie Ihre Angaben und versuchen Sie es erneut.'
+            : 'Incorrect email address or password. Please check your credentials and try again.'
+        );
+      }
+      if (code === 'auth/too-many-requests') {
+        throw new Error(
+          language === 'ar'
+            ? 'تم إيقاف تسجيل الدخول مؤقتاً بسبب محاولات فاشلة متكررة. يرجى المحاولة بعد قليل.'
+            : 'Sign-in temporarily disabled due to repeated failed attempts. Please try again later.'
+        );
+      }
+      if (code === 'auth/invalid-email') {
+        throw new Error(
+          language === 'ar'
+            ? 'صيغة البريد الإلكتروني غير صالحة.'
+            : 'The email address format is invalid.'
+        );
+      }
       console.warn('Firebase Auth direct login error, verifying with Cloud & Local Account Registry:', fbErr.code || fbErr.message);
     }
 
@@ -748,22 +616,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             ? 'لقد تم حذف حسابك من إدارة الموقع.'
             : 'Your account has been deleted by the administration.'
         );
-      }
-
-      // Strict email verification check (No access for unverified users)
-      const isSuperAdmin = cleanEmail === SUPER_ADMIN_EMAIL || cleanEmail === 'zeadmorud1999@gmail.com';
-      if (!isSuperAdmin && !localMatch.profile.emailVerified) {
-        const serverVerified = await checkVerificationStatus(cleanEmail);
-        if (serverVerified) {
-          localMatch.profile.emailVerified = true;
-          saveLocalAccount(localMatch);
-          try {
-            await setDoc(doc(db, 'users', localMatch.uid), { emailVerified: true }, { merge: true });
-          } catch {}
-        } else {
-          setUnverifiedEmail(cleanEmail);
-          throw new Error('EMAIL_VERIFICATION_REQUIRED');
-        }
       }
 
       setUser({
@@ -829,21 +681,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           );
         }
 
-        // Strict email verification check (No access for unverified users)
-        const isSuperAdmin = cleanEmail === SUPER_ADMIN_EMAIL || cleanEmail === 'zeadmorud1999@gmail.com';
-        if (!isSuperAdmin && !userProf.emailVerified) {
-          const serverVerified = await checkVerificationStatus(cleanEmail);
-          if (serverVerified) {
-            userProf.emailVerified = true;
-            try {
-              await setDoc(doc(db, 'users', foundDoc.uid), { emailVerified: true }, { merge: true });
-            } catch {}
-          } else {
-            setUnverifiedEmail(cleanEmail);
-            throw new Error('EMAIL_VERIFICATION_REQUIRED');
-          }
-        }
-
         saveLocalAccount({
           uid: foundDoc.uid,
           email: cleanEmail,
@@ -863,7 +700,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
     } catch (e: any) {
-      if (e.message.includes('password') || e.message.includes('deleted')) throw e;
+      if (e.message?.includes('password') || e.message?.includes('deleted') || e.message?.includes('البريد الإلكتروني أو كلمة المرور')) throw e;
     }
 
     throw new Error(
@@ -1062,11 +899,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         language,
         getAllRegisteredUsers,
         adminDeleteUserAccount,
-        sendVerificationLink,
-        checkVerificationStatus,
-        resendVerificationLink,
-        unverifiedEmail,
-        setUnverifiedEmail,
         accountDeletedByAdmin,
         dismissDeletedAccountModal,
         notifications,

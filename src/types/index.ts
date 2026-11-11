@@ -185,6 +185,26 @@ export type SurgicalParticipationLevel =
   | 'Performed Under Supervision'
   | 'Other';
 
+/**
+ * Cryptographic supervisor signature.
+ * `contentHash` is a SHA-256 digest over the full clinical content of the
+ * record at the moment of signing. The record becomes IMMUTABLE once signed:
+ * any later edit changes the recomputed hash and is rejected by the app and
+ * flagged as tampered in the audit trail.
+ */
+export interface SupervisorSignature {
+  supervisorId: string;
+  supervisorName: string;
+  supervisorDegree?: string;
+  supervisorPosition?: string;
+  signedAt: string; // ISO timestamp
+  contentHash: string; // SHA-256 of the signed payload
+  algorithm: 'SHA-256';
+  traineeId: string;
+  traineeName: string;
+  traineePosition?: string;
+}
+
 export interface TrainingRecord {
   id: string;
   userId: string;
@@ -214,6 +234,7 @@ export interface TrainingRecord {
   supervisorFeedback?: string;
   additionalNotes?: string;
   verified: boolean;
+  signature?: SupervisorSignature; // Digital signature — record becomes immutable
   createdAt: string;
   updatedAt: string;
 }

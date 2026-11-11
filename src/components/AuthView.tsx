@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState } from 'react';
 import {
   Mail,
   Lock,
@@ -9,11 +9,7 @@ import {
   CheckCircle2,
   ShieldCheck,
   KeyRound,
-  Clock,
-  RotateCcw,
   Sparkles,
-  ArrowLeft,
-  Check
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { translations } from '../lib/i18n';
@@ -25,19 +21,14 @@ export const AuthView: React.FC = () => {
     registerWithEmail,
     loginWithGoogle,
     resetPasswordDirect,
-    sendVerificationLink,
-    checkVerificationStatus,
-    resendVerificationLink,
-    unverifiedEmail,
-    setUnverifiedEmail,
     language,
-    setLanguage
+    setLanguage,
   } = useAuth();
 
   const t = translations[language] || translations.en;
   const isRTL = language === 'ar';
 
-  const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'verify_link_sent'>('login');
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login');
 
   // Registration Fields
   const [email, setEmail] = useState('');
@@ -51,10 +42,6 @@ export const AuthView: React.FC = () => {
   const [hospitals, setHospitals] = useState('');
   const [profilePhoto, setProfilePhoto] = useState<string>('');
 
-  // Strict 30-Second Verification Timer state
-  const [verificationTimer, setVerificationTimer] = useState<number>(30);
-  const [canResendLink, setCanResendLink] = useState<boolean>(false);
-
   // Forgot password fields
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -62,33 +49,6 @@ export const AuthView: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
   const [successMessage, setSuccessMessage] = useState('');
-
-  // Sync unverifiedEmail from AuthContext if present
-  useEffect(() => {
-    if (unverifiedEmail) {
-      setEmail(unverifiedEmail);
-      setMode('verify_link_sent');
-      setVerificationTimer(30);
-      setCanResendLink(false);
-    }
-  }, [unverifiedEmail]);
-
-  // Strict 30-second verification countdown timer
-  useEffect(() => {
-    let interval: any = null;
-    if (mode === 'verify_link_sent' && verificationTimer > 0) {
-      interval = setInterval(() => {
-        setVerificationTimer(prev => {
-          if (prev <= 1) {
-            setCanResendLink(true);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-    }
-    return () => clearInterval(interval);
-  }, [mode, verificationTimer]);
 
   const handlePhotoSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -109,24 +69,15 @@ export const AuthView: React.FC = () => {
     try {
       await loginWithEmail(email, password);
     } catch (err: any) {
-      if (err.message === 'EMAIL_VERIFICATION_REQUIRED') {
-        setMode('verify_link_sent');
-        setVerificationTimer(0);
-        setCanResendLink(true);
-        setSuccessMessage(
-          isRTL
-            ? `بريدك الإلكتروني (${email}) غير مؤكد بعد. اضغط على "إعادة إرسال رابط تأكيد جديد" بالأسفل لتصلك رسالة تحقق جديدة على بريدك فقط — لن يظهر الرابط في هذه الواجهة أبداً.`
-            : `Your email (${email}) is not yet verified. Click "Resend Verification Link" below to receive a fresh verification link in your inbox only — the link will never appear in this interface.`
-        );
-      } else {
-        setErrorMessage(err.message || 'Authentication failed. Please verify credentials.');
-      }
+      setErrorMessage(err.message || 'Authentication failed. Please verify credentials.');
     } finally {
       setLoading(false);
     }
   };
 
-  // Complete Registration with Server-Dispatched Verification Link (Strict 30s Expiration)
+  // Complete Registration — the account is created and activated instantly.
+  // The user enters the platform immediately; all later sign-ins use
+  // email + password only, and any mismatch is rejected.
   const handleInitiateRegistration = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage('');
@@ -169,85 +120,13 @@ export const AuthView: React.FC = () => {
         profilePhotoUrl: profilePhoto,
       });
 
-      setVerificationTimer(30);
-      setCanResendLink(false);
-      setMode('verify_link_sent');
       setSuccessMessage(
         isRTL
-          ? `تم إنشاء حسابك بنجاح! تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني (${email}) فقط — لن يظهر الرابط في هذه الواجهة. يرجى فتح بريدك والنقر على الرابط خلال 30 ثانية لتفعيل الحساب.`
-          : `Your account has been created. A verification link has been sent PRIVATELY to your registered email address (${email}) only — it will never appear in this interface. Please open your inbox and click the link within 30 seconds to activate your account.`
+          ? `تم إنشاء حسابك وتفعيله بنجاح! يتم الآن الدخول المباشر إلى محفظتك الجراحية. في المرات القادمة يمكنك تسجيل الدخول مباشرة بالبريد (${email}) وكلمة المرور.`
+          : `Your account has been created and activated! Entering your surgical portfolio now. Next time, sign in directly with your email (${email}) and password.`
       );
     } catch (err: any) {
-      if (err.message === 'EMAIL_SEND_FAILED') {
-        // Account WAS created successfully, but the verification email could
-        // not be dispatched right now. Route the user to the verification
-        // screen so they can retry via "Resend Verification Link" — never
-        // leave them stranded on the registration form.
-        setMode('verify_link_sent');
-        setVerificationTimer(0);
-        setCanResendLink(true);
-        setErrorMessage(
-          isRTL
-            ? `تم إنشاء حسابك بنجاح، لكن تعذر إرسال بريد التحقق مؤقتاً. اضغط على "إعادة إرسال رابط تأكيد جديد" بالأسفل لتصلك رسالة التحقق على بريدك (${email}).`
-            : `Your account was created successfully, but we could not dispatch the verification email right now. Click "Resend Verification Link" below to receive the verification message at (${email}).`
-        );
-      } else {
-        setErrorMessage(err.message || 'Failed to complete registration.');
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Resend Real Verification Link (Fresh 30s Server Token)
-  const handleResendLink = async () => {
-    setErrorMessage('');
-    setSuccessMessage('');
-    setLoading(true);
-    try {
-      await resendVerificationLink(email.trim(), fullName);
-      setVerificationTimer(30);
-      setCanResendLink(false);
-      setSuccessMessage(
-        isRTL
-          ? 'تم إرسال رابط تأكيد جديد بنجاح إلى بريدك الإلكتروني فقط! صلاحية الرابط 30 ثانية. لن يظهر الرابط في هذه الواجهة.'
-          : 'A fresh verification link has been dispatched PRIVATELY to your email only! Valid for 30 seconds. The link will never be displayed in this interface.'
-      );
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to resend verification link.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Refresh Verification Status (Query backend to verify if link was clicked)
-  const handleCheckStatus = async () => {
-    setErrorMessage('');
-    setSuccessMessage('');
-    setLoading(true);
-    try {
-      const isVerified = await checkVerificationStatus(email.trim());
-      if (isVerified) {
-        setSuccessMessage(
-          isRTL
-            ? 'تم التحقق من بريدك بنجاح! يتم الآن تسجيل الدخول إلى محفظتك الجراحية...'
-            : 'Email verified successfully! Entering your surgical portfolio...'
-        );
-        // Attempt immediate login with existing password
-        if (password) {
-          await loginWithEmail(email.trim(), password);
-        } else {
-          setMode('login');
-        }
-      } else {
-        setErrorMessage(
-          isRTL
-            ? 'لم يتم النقر على رابط التحقق بعد. يرجى فتح صندوق الوارد في بريدك والنقر على "Verify SurgiTrack Account" خلال 30 ثانية من إرساله.'
-            : 'Verification link has not been clicked yet. Please check your inbox and click the verification button within 30 seconds of dispatch.'
-        );
-      }
-    } catch (err: any) {
-      setErrorMessage(err.message || 'Status check failed.');
+      setErrorMessage(err.message || 'Failed to complete registration.');
     } finally {
       setLoading(false);
     }
@@ -380,8 +259,6 @@ export const AuthView: React.FC = () => {
                       ? (isRTL ? '— تسجيل الدخول' : '— Sign In')
                       : mode === 'register'
                       ? (isRTL ? '— تسجيل حساب جديد' : '— New Registration')
-                      : mode === 'verify_link_sent'
-                      ? (isRTL ? '— تأكيد البريد الإلكتروني' : '— Email Verification Required')
                       : (isRTL ? '— تعيين كلمة المرور' : '— Reset Password')}
                   </span>
                 </h2>
@@ -395,45 +272,43 @@ export const AuthView: React.FC = () => {
 
             <div className="flex items-center gap-1.5 text-xs font-semibold bg-teal-950/70 text-teal-300 px-3 py-1 rounded-full border border-teal-500/40">
               <ShieldCheck size={14} />
-              <span>{isRTL ? 'تحقق آمن' : 'Secured'}</span>
+              <span>{isRTL ? 'دخول آمن' : 'Secured'}</span>
             </div>
           </div>
 
-          {/* Mode Switch Tabs (hidden during verification step) */}
-          {mode !== 'verify_link_sent' && (
-            <div className="grid grid-cols-2 border-b border-slate-200 bg-slate-50 text-xs font-bold">
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('login');
-                  setErrorMessage('');
-                  setSuccessMessage('');
-                }}
-                className={`py-3.5 text-center transition cursor-pointer border-b-2 ${
-                  mode === 'login'
-                    ? 'border-[#0D9488] text-[#0D9488] bg-white'
-                    : 'border-transparent text-slate-500 hover:text-slate-800'
-                }`}
-              >
-                {isRTL ? 'تسجيل الدخول' : language === 'de' ? 'Anmelden' : 'Sign In'}
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMode('register');
-                  setErrorMessage('');
-                  setSuccessMessage('');
-                }}
-                className={`py-3.5 text-center transition cursor-pointer border-b-2 ${
-                  mode === 'register'
-                    ? 'border-[#0D9488] text-[#0D9488] bg-white'
-                    : 'border-transparent text-slate-500 hover:text-slate-800'
-                }`}
-              >
-                {isRTL ? 'إنشاء حساب جديد' : language === 'de' ? 'Konto erstellen' : 'Create Account'}
-              </button>
-            </div>
-          )}
+          {/* Mode Switch Tabs */}
+          <div className="grid grid-cols-2 border-b border-slate-200 bg-slate-50 text-xs font-bold">
+            <button
+              type="button"
+              onClick={() => {
+                setMode('login');
+                setErrorMessage('');
+                setSuccessMessage('');
+              }}
+              className={`py-3.5 text-center transition cursor-pointer border-b-2 ${
+                mode === 'login'
+                  ? 'border-[#0D9488] text-[#0D9488] bg-white'
+                  : 'border-transparent text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              {isRTL ? 'تسجيل الدخول' : language === 'de' ? 'Anmelden' : 'Sign In'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setMode('register');
+                setErrorMessage('');
+                setSuccessMessage('');
+              }}
+              className={`py-3.5 text-center transition cursor-pointer border-b-2 ${
+                mode === 'register'
+                  ? 'border-[#0D9488] text-[#0D9488] bg-white'
+                  : 'border-transparent text-slate-500 hover:text-slate-800'
+              }`}
+            >
+              {isRTL ? 'إنشاء حساب جديد' : language === 'de' ? 'Konto erstellen' : 'Create Account'}
+            </button>
+          </div>
 
           {/* Feedback Messages */}
           <div className="p-6 pb-0 space-y-3">
@@ -547,6 +422,12 @@ export const AuthView: React.FC = () => {
                   </svg>
                   <span>{isRTL ? 'الدخول بحساب Google' : 'Sign in with Google'}</span>
                 </button>
+
+                <p className="text-[10px] text-slate-400 text-center leading-relaxed pt-1">
+                  {isRTL
+                    ? 'يقوم النظام بالتحقق من تطابق البريد الإلكتروني وكلمة المرور تماماً، ويتم رفض الدخول فوراً عند أي اختلاف.'
+                    : 'The system matches your email and password exactly — any mismatch results in immediate sign-in rejection.'}
+                </p>
               </form>
             )}
 
@@ -709,103 +590,24 @@ export const AuthView: React.FC = () => {
                   />
                 </div>
 
+                <div className="flex items-start gap-2 p-3 bg-teal-50/70 border border-teal-200 rounded-2xl text-[11px] text-teal-900 leading-relaxed">
+                  <Sparkles size={14} className="text-teal-600 shrink-0 mt-0.5" />
+                  <span>
+                    {isRTL
+                      ? 'يتم تفعيل الحساب فور التسجيل مباشرة دون أي خطوات إضافية. تُحفظ بياناتك بأمان، وتدخل في المرات القادمة ببساطة عبر البريد وكلمة المرور.'
+                      : 'Your account is activated instantly upon registration — no extra steps. Your credentials are stored securely, and future sign-ins use simply your email and password.'}
+                  </span>
+                </div>
+
                 <button
                   type="submit"
                   disabled={loading}
                   className="w-full mt-2 bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs py-3 rounded-xl transition shadow-md shadow-teal-900/20 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
                 >
-                  <span>{loading ? 'Processing...' : isRTL ? 'إنشاء الحساب وإرسال رابط التحقق المباشر' : 'Create Account & Dispatch Verification Link'}</span>
+                  <span>{loading ? 'Processing...' : isRTL ? 'إنشاء الحساب والدخول مباشرة' : 'Create Account & Enter Now'}</span>
                   <ArrowRight size={15} />
                 </button>
               </form>
-            )}
-
-            {/* STRICT EMAIL-LINK VERIFICATION REQUIRED SCREEN (NO OTP, NO CODES) */}
-            {mode === 'verify_link_sent' && (
-              <div className="space-y-5 animate-fadeIn">
-                <div className="p-4 bg-teal-50/80 border border-teal-200 rounded-2xl text-xs text-teal-950 space-y-2.5">
-                  <div className="flex items-center gap-2">
-                    <ShieldCheck size={20} className="text-teal-700 shrink-0" />
-                    <strong className="font-bold text-sm">
-                      {isRTL ? 'تأكيد صحة البريد الإلكتروني إلزامي لتفعيل الحساب' : 'Email Verification Required to Activate Account'}
-                    </strong>
-                  </div>
-                  <p className="leading-relaxed text-slate-700">
-                    {isRTL
-                      ? 'تم إنشاء حسابك بنجاح. تم إرسال رابط تأكيد حصري ومباشر إلى بريدك الإلكتروني المسجل فقط. يرجى فتح البريد والنقر على الرابط خلال 30 ثانية لتفعيل حسابك والدخول إلى المحفظة الجراحية:'
-                      : 'Your account has been created. A verification link has been sent directly to your registered email address only. Please open the link within 30 seconds to activate your account:'}
-                  </p>
-                  <div className="bg-white p-2.5 rounded-xl border border-teal-200/80 flex items-center gap-2 text-slate-800 font-mono font-bold text-xs">
-                    <Mail size={15} className="text-teal-600 shrink-0" />
-                    <span className="truncate">{email}</span>
-                  </div>
-                  {/* Strict privacy reminder — verification URLs and tokens are NEVER shown here */}
-                  <div className="flex items-start gap-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-xl p-2.5 mt-1">
-                    <ShieldCheck size={14} className="text-amber-700 shrink-0 mt-0.5" />
-                    <span className="leading-snug">
-                      {isRTL
-                        ? 'لأسباب أمنية صارمة: رابط التحقق موجود فقط داخل رسالة البريد الإلكتروني المرسلة إلى بريدك. لن يظهر الرابط أو الرمز في هذه الواجهة، ولن يطلبه منك أي عضو في فريق SurgiTrack أبداً. تحقق من مجلد الرسائل غير المرغوب فيها (Spam) إذا لم تجد الرسالة في صندوق الوارد.'
-                        : 'For strict security: the verification link exists ONLY inside the email sent to your inbox. SurgiTrack will NEVER display the link or token in this interface, and our staff will NEVER ask you to share it. Check your spam/junk folder if you do not see it in your inbox.'}
-                    </span>
-                  </div>
-                </div>
-
-                {/* Real-time 30-Second Expiration Timer */}
-                <div className="flex items-center justify-between p-3.5 bg-slate-50 rounded-2xl border border-slate-200 text-xs">
-                  <div className="flex items-center gap-2 text-slate-700">
-                    <Clock size={16} className={verificationTimer > 0 ? 'text-teal-600 animate-pulse' : 'text-red-500'} />
-                    <span className="font-semibold">{isRTL ? 'صلاحية الرابط:' : 'Link Validity:'}</span>
-                    <span className={`font-mono font-bold text-sm ${verificationTimer > 0 ? 'text-teal-800' : 'text-red-600'}`}>
-                      00:{verificationTimer.toString().padStart(2, '0')}
-                    </span>
-                  </div>
-
-                  <span className="text-[11px] text-slate-400 font-medium">
-                    {verificationTimer > 0
-                      ? (isRTL ? 'ينتهي خلال 30 ثانية' : 'Expires in 30s')
-                      : (isRTL ? 'انتهت صلاحية الرابط' : 'Link expired')}
-                  </span>
-                </div>
-
-                {/* Action Buttons: Refresh Status & Resend Link */}
-                <div className="space-y-2.5 pt-1">
-                  <button
-                    type="button"
-                    onClick={handleCheckStatus}
-                    disabled={loading}
-                    className="w-full bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs py-3 rounded-xl shadow-md shadow-teal-900/10 transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
-                  >
-                    <Check size={16} />
-                    <span>{loading ? 'Checking...' : isRTL ? 'تحديث حالة التحقق (نقرت على الرابط)' : 'Refresh Verification Status'}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={handleResendLink}
-                    disabled={loading}
-                    className="w-full bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs py-2.5 rounded-xl border border-slate-300 transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50"
-                  >
-                    <RotateCcw size={14} className="text-teal-700" />
-                    <span>{isRTL ? 'إعادة إرسال رابط تأكيد جديد (30 ثانية)' : 'Resend Verification Link (30s)'}</span>
-                  </button>
-                </div>
-
-                {/* Back to Login */}
-                <div className="pt-2 text-center">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMode('login');
-                      setErrorMessage('');
-                      setSuccessMessage('');
-                    }}
-                    className="inline-flex items-center gap-1.5 text-xs text-slate-500 hover:text-slate-800 font-bold cursor-pointer transition"
-                  >
-                    <ArrowLeft size={13} />
-                    <span>{isRTL ? 'تسجيل الخروج والرجوع إلى شاشة الدخول' : 'Sign Out / Return to Sign In'}</span>
-                  </button>
-                </div>
-              </div>
             )}
 
             {/* DIRECT PASSWORD RESET FORM */}

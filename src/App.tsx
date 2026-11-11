@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   LayoutDashboard,
   FolderPlus,
@@ -34,6 +34,10 @@ import {
   Users,
   Download,
   LogOut,
+  LibraryBig,
+  TrendingUp,
+  Globe2,
+  MonitorSmartphone,
 } from 'lucide-react';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { DataProvider, useData } from './context/DataContext';
@@ -49,6 +53,9 @@ import { RecommendationGenerator } from './components/RecommendationGenerator';
 import { GermanPortfolioView } from './components/GermanPortfolioView';
 import { SurgicalNewsView } from './components/SurgicalNewsView';
 import { PubMedSearchEngineView } from './components/PubMedSearchEngineView';
+import { MedicalJournalsView } from './components/MedicalJournalsView';
+import { LearningCurveView } from './components/LearningCurveView';
+import { AccreditationView } from './components/AccreditationView';
 import { BackupRestoreView } from './components/BackupRestoreView';
 import { UserProfileView } from './components/UserProfileView';
 import { AdminPanelView } from './components/AdminPanelView';
@@ -62,9 +69,12 @@ type ActiveView =
   | 'news'
   | 'community'
   | 'pubmed'
+  | 'journals'
   | 'dashboard'
+  | 'learning'
   | 'cases'
   | 'supervisors'
+  | 'accreditation'
   | 'sessions'
   | 'skills'
   | 'recommendations'
@@ -109,6 +119,27 @@ function SurgiTrackApp() {
   const [replySending, setReplySending] = useState(false);
   const [replySuccessMessage, setReplySuccessMessage] = useState('');
   const [replyErrorMessage, setReplyErrorMessage] = useState('');
+
+  // PWA install prompt
+  const [installPromptEvt, setInstallPromptEvt] = useState<any>(null);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      e.preventDefault();
+      setInstallPromptEvt(e);
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  const handleInstallApp = async () => {
+    if (!installPromptEvt) return;
+    installPromptEvt.prompt();
+    const choice = await installPromptEvt.userChoice;
+    if (choice?.outcome === 'accepted') {
+      setInstallPromptEvt(null);
+    }
+  };
 
   const t = translations[language] || translations.en;
   const isRTL = language === 'ar';
@@ -173,9 +204,12 @@ function SurgiTrackApp() {
     { id: 'news', label: t.news, icon: Newspaper },
     { id: 'community', label: isRTL ? 'المجتمع الجراحي' : 'Surgical Community', icon: Users, count: communityCases?.length },
     { id: 'pubmed', label: t.pubmed, icon: BookOpen },
+    { id: 'journals', label: isRTL ? 'المجلات الطبية' : 'Medical Journals', icon: LibraryBig },
     { id: 'dashboard', label: t.dashboard, icon: LayoutDashboard },
+    { id: 'learning', label: isRTL ? 'منحنى التعلم' : 'Learning Curve', icon: TrendingUp },
     { id: 'cases', label: t.cases, icon: FolderPlus, count: cases.length },
     { id: 'supervisors', label: t.logbookEntries || (isRTL ? 'سجل العمليات والمهارات' : 'Logbook Entries'), icon: UserCheck, count: supervisors.length },
+    { id: 'accreditation', label: isRTL ? 'الاعتماد الدولي' : 'Accreditation', icon: Globe2 },
     { id: 'recommendations', label: t.recommendations, icon: Sparkles },
     { id: 'german', label: t.germanPortfolio, icon: FileCheck2 },
     { id: 'backup', label: t.backup, icon: HardDrive },
@@ -187,6 +221,7 @@ function SurgiTrackApp() {
   const quickNavItems = [
     { id: 'community' as ActiveView, label: isRTL ? 'المجتمع' : 'Community', icon: Users, count: communityCases?.length },
     { id: 'dashboard' as ActiveView, label: t.quickNavDashboard, icon: LayoutDashboard },
+    { id: 'learning' as ActiveView, label: isRTL ? 'منحنى التعلم' : 'Learning', icon: TrendingUp },
     { id: 'cases' as ActiveView, label: t.quickNavCases, icon: FolderPlus, count: cases.length },
     { id: 'supervisors' as ActiveView, label: t.quickNavLogbook || (isRTL ? 'سجل العمليات' : 'Logbook'), icon: UserCheck, count: supervisors.length },
     { id: 'pubmed' as ActiveView, label: 'PubMed', icon: BookOpen },
@@ -267,6 +302,18 @@ function SurgiTrackApp() {
                 </span>
               )}
             </button>
+
+            {/* PWA Install App Button (appears when the browser offers installation) */}
+            {installPromptEvt && (
+              <button
+                onClick={handleInstallApp}
+                className="hidden sm:flex items-center gap-1.5 p-2 px-3 rounded-xl bg-teal-500/20 hover:bg-teal-500/35 border border-teal-400/50 text-teal-200 hover:text-white transition cursor-pointer shrink-0 text-[11px] font-bold"
+                title={isRTL ? 'تثبيت SurgiTrack كتطبيق على جهازك (يعمل دون إنترنت للبيانات المحفوظة)' : 'Install SurgiTrack as an app (offline-ready for cached data)'}
+              >
+                <MonitorSmartphone size={15} />
+                <span>{isRTL ? 'تثبيت التطبيق' : 'Install App'}</span>
+              </button>
+            )}
 
             {/* Notifications Bell with Unread Badge */}
             <button
@@ -638,6 +685,9 @@ function SurgiTrackApp() {
 
           {/* PubMed Evidence & Research Engine */}
           {activeView === 'pubmed' && <PubMedSearchEngineView />}
+          {activeView === 'journals' && <MedicalJournalsView />}
+          {activeView === 'learning' && <LearningCurveView />}
+          {activeView === 'accreditation' && <AccreditationView />}
 
           {/* 2nd View: My Surgical Dashboard */}
           {activeView === 'dashboard' && (

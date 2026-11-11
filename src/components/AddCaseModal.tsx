@@ -28,6 +28,8 @@ import {
   SAMPLE_GENERAL_SURGERY_CLINICAL_CASE,
 } from '../lib/medicalDefaults';
 import { StandardSelectWithOther } from './StandardSelectWithOther';
+import { AiCaseSuggestions } from './AiCaseSuggestions';
+import { useAuth } from '../context/AuthContext';
 
 interface AddCaseModalProps {
   isOpen: boolean;
@@ -51,6 +53,8 @@ export const AddCaseModal: React.FC<AddCaseModalProps> = ({
 }) => {
   // Generate random anonymous case reference if creating
   const autoRef = existingCase?.caseReference || `CAS-2026-${Math.floor(1000 + Math.random() * 9000)}`;
+
+  const { language } = useAuth();
 
   const [caseReference] = useState(autoRef);
   const [patientAge, setPatientAge] = useState<number>(existingCase?.patientAge || 55);
@@ -807,6 +811,16 @@ export const AddCaseModal: React.FC<AddCaseModalProps> = ({
                 options={COMMON_PRIMARY_DIAGNOSES}
                 placeholder="-- Select Standard Diagnosis or Enter Custom --"
                 required
+              />
+
+              {/* AI Case Suggestions — Gemini evidence engine linked to PubMed */}
+              <AiCaseSuggestions
+                diagnosis={primaryDiagnosis}
+                patientAge={patientAge}
+                patientSex={patientSex}
+                specialty={specialty}
+                language={language}
+                onApplyIcd={(code) => setIcd10Code(code)}
               />
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

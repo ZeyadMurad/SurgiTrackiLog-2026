@@ -22,6 +22,10 @@ import {
   Mail,
   GraduationCap,
   Stethoscope,
+  PenLine,
+  Lock,
+  ShieldCheck,
+  Loader2,
 } from 'lucide-react';
 import { useData } from '../context/DataContext';
 import { useAuth } from '../context/AuthContext';
@@ -54,6 +58,8 @@ export const SupervisorView: React.FC = () => {
     addSkill,
     updateSkill,
     deleteSkill,
+    signTrainingRecords,
+    verifyRecordIntegrityAsync,
   } = useData();
 
   const { profile, language, user } = useAuth();
@@ -77,6 +83,12 @@ export const SupervisorView: React.FC = () => {
   const [editingSupervisor, setEditingSupervisor] = useState<Supervisor | null>(null);
 
   const [viewingCaseDetail, setViewingCaseDetail] = useState<ClinicalCase | null>(null);
+
+  // Digital signature state
+  const [showSignModal, setShowSignModal] = useState(false);
+  const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
+  const [signing, setSigning] = useState(false);
+  const [signResult, setSignResult] = useState<string>('');
 
   interface DeleteTarget {
     type: 'supervisor' | 'record' | 'case' | 'skill';
@@ -186,6 +198,39 @@ export const SupervisorView: React.FC = () => {
   // Records strictly belonging to this supervisor (Section 2 & 3 rule)
   // Backward compatibility: If records don't have supervisorId or matches first supervisor
   const supRecords = trainingRecords.filter(r => r.supervisorId === (activeSupervisor?.id || ''));
+  const unsignedRecords = supRecords.filter(r => !r.signature);
+  const signedRecordsCount = supRecords.filter(r => r.signature).length;
+
+  const handleSignSelected = async () => {
+    if (!activeSupervisor || selectedRecordIds.length === 0) return;
+    setSigning(true);
+    setSignResult('');
+    try {
+      const count = await signTrainingRecords(
+        selectedRecordIds,
+        activeSupervisor,
+        {
+          id: profile?.userId || user?.uid || '',
+          name: profile?.fullName || 'Surgical Trainee',
+          position: profile?.currentPosition,
+        }
+      );
+      setSignResult(
+        isRTL
+          ? `تم توقيع ${count} سجلاً رقمياً بواسطة ${activeSupervisor.fullName} — أصبحت السجلات مقفلة وغير قابلة للتعديل نهائياً مع بصمة تحقق SHA-256.`
+          : `${count} record(s) digitally signed by ${activeSupervisor.fullName} — records are now permanently locked and tamper-proof with SHA-256 attestation.`
+      );
+      setSelectedRecordIds([]);
+      setTimeout(() => {
+        setShowSignModal(false);
+        setSignResult('');
+      }, 2600);
+    } catch (err: any) {
+      setSignResult(err.message || 'Signing failed.');
+    } finally {
+      setSigning(false);
+    }
+  };
   const supSessions = trainingSessions.filter(s => s.supervisorId === (activeSupervisor?.id || ''));
 
   // Cases strictly belonging to this supervisor (or unassigned assigned to first supervisor for backward compatibility)
@@ -580,15 +625,37 @@ export const SupervisorView: React.FC = () => {
                   <p className="text-xs text-slate-500">
                     Documented operative procedures and supervised training hours under <strong>{activeSupervisor.fullName}</strong>
                   </p>
-                  <button
-                    onClick={() => {
-                      setEditingRecord(null);
-                      setShowAddRecordModal(true);
-                    }}
-                    className="flex items-center gap-1.5 text-xs font-bold text-teal-700 hover:text-teal-900 cursor-pointer"
-                  >
-                    <Plus size={14} /> Add Record
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        setEditingRecord(null);
+                        setShowAddRecordModal(true);
+                      }}
+                      className="flex items-center gap-1.5 text-xs font-bold text-teal-700 hover:text-teal-900 cursor-pointer"
+                    >
+                      <Plus size={14} /> Add Record
+                    </button>
+                    {unsignedRecords.length > 0 && (
+                      <button
+                        onClick={() => {
+                          setSelectedRecordIds(unsignedRecords.map(r => r.id));
+                          setSignResult('');
+                          setShowSignModal(true);
+                        }}
+                        className="flex items-center gap-1.5 text-xs font-bold text-indigo-700 hover:text-indigo-900 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 px-2.5 py-1 rounded-xl cursor-pointer transition"
+                        title={isRTL ? 'توقيع رقمي جماعي للسجلات غير الموقعة — يصبح السجل مقفلاً وغير قابل للتعديل بعد التوقيع' : 'Batch digital signature of unsigned records — records become locked & immutable once signed'}
+                      >
+                        <PenLine size={13} />
+                        {isRTL ? `توقيع رقمي (${unsignedRecords.length})` : `Digitally Sign (${unsignedRecords.length})`}
+                      </button>
+                    )}
+                    {signedRecordsCount > 0 && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-bold text-emerald-800 bg-emerald-50 px-2 py-1 rounded-full border border-emerald-200">
+                        <ShieldCheck size={11} />
+                        {signedRecordsCount} {isRTL ? 'موقّع ومقفل' : 'Signed & Locked'}
+                      </span>
+                    )}
+                  </div>
                 </div>
 
                 {supRecords.length > 0 ? (
@@ -620,7 +687,14 @@ export const SupervisorView: React.FC = () => {
                             <td className="p-3 font-mono font-bold text-slate-800">{r.netTrainingHours}h</td>
                             <td className="p-3 text-slate-600">{r.supervisionLevel}</td>
                             <td className="p-3">
-                              {r.verified ? (
+                              {r.signature ? (
+                                <span
+                                  className="inline-flex items-center gap-1 text-[10px] text-indigo-800 font-bold bg-indigo-50 px-2 py-0.5 rounded-full border border-indigo-200"
+                                  title={`SHA-256: ${r.signature.contentHash.substring(0, 24)}… — ${isRTL ? 'موقّع رقمياً بواسطة' : 'Digitally signed by'} ${r.signature.supervisorName} ${isRTL ? 'في' : 'at'} ${new Date(r.signature.signedAt).toLocaleString()}`}
+                                >
+                                  <Lock size={10} /> {isRTL ? 'موقّع ومقفل' : 'Signed'}
+                                </span>
+                              ) : r.verified ? (
                                 <span className="inline-flex items-center gap-1 text-[10px] text-emerald-700 font-bold bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
                                   <CheckCircle2 size={11} /> Verified
                                 </span>
@@ -632,30 +706,42 @@ export const SupervisorView: React.FC = () => {
                             </td>
                             <td className="p-3 text-right">
                               <div className="flex items-center justify-end gap-1">
-                                <button
-                                  onClick={() => {
-                                    setEditingRecord(r);
-                                    setShowAddRecordModal(true);
-                                  }}
-                                  className="p-1.5 text-slate-500 hover:text-teal-700 transition rounded-lg hover:bg-slate-100 cursor-pointer"
-                                  title="Edit Record"
-                                >
-                                  <Edit3 size={14} />
-                                </button>
-                                <button
-                                  onClick={() => {
-                                    setDeleteTarget({
-                                      type: 'record',
-                                      id: r.id,
-                                      parentId: activeSupervisor.id,
-                                      name: r.procedureName || r.activityType || r.trainingDate,
-                                    });
-                                  }}
-                                  className="p-1.5 text-red-400 hover:text-red-700 transition rounded-lg hover:bg-red-50 cursor-pointer"
-                                  title="Delete Record"
-                                >
-                                  <Trash2 size={14} />
-                                </button>
+                                {r.signature ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-[10px] text-slate-400 font-semibold px-2 py-1"
+                                    title={isRTL ? 'سجل موقّع رقمياً — غير قابل للتعديل أو الحذف نهائياً' : 'Digitally signed record — permanently immutable'}
+                                  >
+                                    <Lock size={12} />
+                                    {isRTL ? 'محمي' : 'Immutable'}
+                                  </span>
+                                ) : (
+                                  <>
+                                    <button
+                                      onClick={() => {
+                                        setEditingRecord(r);
+                                        setShowAddRecordModal(true);
+                                      }}
+                                      className="p-1.5 text-slate-500 hover:text-teal-700 transition rounded-lg hover:bg-slate-100 cursor-pointer"
+                                      title="Edit Record"
+                                    >
+                                      <Edit3 size={14} />
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setDeleteTarget({
+                                          type: 'record',
+                                          id: r.id,
+                                          parentId: activeSupervisor.id,
+                                          name: r.procedureName || r.activityType || r.trainingDate,
+                                        });
+                                      }}
+                                      className="p-1.5 text-red-400 hover:text-red-700 transition rounded-lg hover:bg-red-50 cursor-pointer"
+                                      title="Delete Record"
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </>
+                                )}
                               </div>
                             </td>
                           </tr>
@@ -1287,6 +1373,142 @@ export const SupervisorView: React.FC = () => {
         <div className="fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-[#101C32] text-teal-300 border border-teal-500/40 px-4 py-2.5 rounded-2xl shadow-2xl text-xs font-bold flex items-center gap-2 animate-bounce">
           <CheckCircle2 size={16} className="text-teal-400" />
           <span>{feedbackMsg}</span>
+        </div>
+      )}
+
+      {/* DIGITAL SIGNATURE MODAL — Immutable supervisor attestation */}
+      {showSignModal && activeSupervisor && (
+        <div className="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-3xl shadow-2xl max-w-2xl w-full max-h-[85vh] overflow-y-auto">
+            <div className="bg-gradient-to-r from-indigo-700 to-teal-700 px-5 py-4 text-white flex items-center justify-between sticky top-0 z-10">
+              <div className="flex items-center gap-2.5">
+                <PenLine size={18} />
+                <div>
+                  <h3 className="text-sm font-extrabold">
+                    {isRTL ? 'التوقيع الرقمي للسجلات التدريبية' : 'Digital Signature of Training Records'}
+                  </h3>
+                  <p className="text-[10px] text-white/80">
+                    {isRTL
+                      ? 'شهادة رقمية مشفّرة (SHA-256) — سجل تدقيق دائم غير قابل للتعديل'
+                      : 'Cryptographic attestation (SHA-256) — permanent immutable audit trail'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => !signing && setShowSignModal(false)}
+                className="p-1.5 rounded-xl hover:bg-white/20 cursor-pointer"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {signResult ? (
+                <div className="flex flex-col items-center justify-center py-8 gap-3 text-center">
+                  <div className="w-14 h-14 rounded-2xl bg-emerald-100 border border-emerald-300 flex items-center justify-center text-emerald-700">
+                    <ShieldCheck size={30} />
+                  </div>
+                  <p className="text-xs font-bold text-emerald-800 max-w-md leading-relaxed">{signResult}</p>
+                </div>
+              ) : (
+                <>
+                  <div className="p-3.5 bg-indigo-50 border border-indigo-200 rounded-2xl text-[11px] text-indigo-950 leading-relaxed space-y-1.5">
+                    <p className="font-bold">
+                      {isRTL
+                        ? `الموقّع: ${activeSupervisor.academicTitle || ''} ${activeSupervisor.fullName}${activeSupervisor.academicDegree ? ` (${activeSupervisor.academicDegree})` : ''}`
+                        : `Signatory: ${activeSupervisor.academicTitle || ''} ${activeSupervisor.fullName}${activeSupervisor.academicDegree ? ` (${activeSupervisor.academicDegree})` : ''}`}
+                    </p>
+                    <p>
+                      {activeSupervisor.professionalPosition} — {activeSupervisor.department}, {activeSupervisor.hospital}
+                    </p>
+                    <p className="text-amber-900 bg-amber-50 border border-amber-200 rounded-xl p-2.5 flex items-start gap-2">
+                      <Lock size={13} className="shrink-0 mt-0.5 text-amber-700" />
+                      <span>
+                        {isRTL
+                          ? 'تحذير أمني: بعد التوقيع يصبح السجل مقفلاً نهائياً — لا تعديل ولا حذف. أي محاولة تغيير لاحقة تُكتشف تلقائياً عبر إعادة حساب البصمة SHA-256 وتُعلَّم كمحاولة عبث في سجل التدقيق.'
+                          : 'Security notice: once signed, the record is permanently locked — no edits, no deletion. Any later change is automatically detected by re-computing the SHA-256 fingerprint and flagged as tampering in the audit trail.'}
+                      </span>
+                    </p>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-bold text-slate-700">
+                        {isRTL
+                          ? `اختر السجلات للتوقيع (${selectedRecordIds.length}/${unsignedRecords.length})`
+                          : `Select records to sign (${selectedRecordIds.length}/${unsignedRecords.length})`}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setSelectedRecordIds(
+                            selectedRecordIds.length === unsignedRecords.length
+                              ? []
+                              : unsignedRecords.map(r => r.id)
+                          )
+                        }
+                        className="text-[10px] font-bold text-teal-700 hover:underline cursor-pointer"
+                      >
+                        {selectedRecordIds.length === unsignedRecords.length
+                          ? isRTL ? 'إلغاء تحديد الكل' : 'Clear all'
+                          : isRTL ? 'تحديد الكل' : 'Select all'}
+                      </button>
+                    </div>
+                    <div className="max-h-64 overflow-y-auto rounded-2xl border border-slate-200 divide-y divide-slate-100">
+                      {unsignedRecords.map(r => {
+                        const checked = selectedRecordIds.includes(r.id);
+                        return (
+                          <label
+                            key={r.id}
+                            className={`flex items-center gap-3 p-3 cursor-pointer transition ${checked ? 'bg-indigo-50/60' : 'hover:bg-slate-50'}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() =>
+                                setSelectedRecordIds(prev =>
+                                  checked ? prev.filter(id => id !== r.id) : [...prev, r.id]
+                                )
+                              }
+                              className="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                            />
+                            <div className="flex-1 min-w-0">
+                              <p className="text-xs font-semibold text-slate-900 truncate">{r.procedureName || r.activityType}</p>
+                              <p className="text-[10px] text-slate-500">
+                                {r.trainingDate} · {r.participationRole} · {r.netTrainingHours}h
+                              </p>
+                            </div>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-3 pt-1">
+                    <button
+                      onClick={() => setShowSignModal(false)}
+                      disabled={signing}
+                      className="px-4 py-2.5 rounded-xl border border-slate-200 text-slate-700 font-bold text-xs hover:bg-slate-50 cursor-pointer"
+                    >
+                      {isRTL ? 'إلغاء' : 'Cancel'}
+                    </button>
+                    <button
+                      onClick={handleSignSelected}
+                      disabled={signing || selectedRecordIds.length === 0}
+                      className="flex-1 py-2.5 rounded-xl bg-gradient-to-r from-indigo-700 to-teal-700 hover:from-indigo-800 hover:to-teal-800 text-white font-bold text-xs shadow-md transition cursor-pointer flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {signing ? <Loader2 size={14} className="animate-spin" /> : <PenLine size={14} />}
+                      {signing
+                        ? isRTL ? 'جاري التوقيع والتشفير...' : 'Signing & hashing...'
+                        : isRTL
+                        ? `توقيع ${selectedRecordIds.length} سجلاً رقمياً الآن`
+                        : `Digitally sign ${selectedRecordIds.length} record(s) now`}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>

@@ -21,13 +21,138 @@ const port = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// Lazy init GoogleGenAI
-const getAI = () => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error('GEMINI_API_KEY environment variable is not configured.');
+// ============================================================
+// AI TEXT GENERATION — provider chain
+//   1. Gemini (Google GenAI SDK) when GEMINI_API_KEY is configured
+//   2. FREE keyless fallback: Pollinations AI (OpenAI-compatible)
+// The chain keeps every AI feature live with zero configuration,
+// and upgrades automatically to Gemini once the key is set.
+// A 24-hour response cache absorbs the free tier's rate limit
+// (1 reply / 45 s / IP) for repeated identical queries.
+// ============================================================
+const POLLINATIONS_URL = 'https://text.pollinations.ai/openai';
+const AI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+const aiProviderName = (): 'gemini' | 'pollinations-free' =>
+  process.env.GEMINI_API_KEY ? 'gemini' : 'pollinations-free';
+
+// Simple in-memory response cache: hash(prompt) -> { text, at }
+const aiCache = new Map<string, { text: string; at: number }>();
+// Parsed case-suggestion payloads keyed by diagnosis profile
+const caseSuggestionsCache = new Map<string, { payload: any; at: number }>();
+const hashString = (s: string): string => {
+  let h1 = 0x811c9dc5;
+  let h2 = 0x1000193;
+  for (let i = 0; i < s.length; i++) {
+    h1 = (h1 ^ s.charCodeAt(i)) >>> 0;
+    h1 = (h1 * 0x01000193) >>> 0;
+    h2 = (h2 + s.charCodeAt(i) * (i + 7)) >>> 0;
   }
-  return new GoogleGenAI({ apiKey });
+  return h1.toString(16) + h2.toString(16);
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const generateText = async (
+  prompt: string,
+  systemInstruction: string,
+  jsonMode = false,
+  options: { cache?: boolean; cacheTtlMs?: number } = {}
+): Promise<string> => {
+  const useCache = options.cache !== false;
+  const cacheKey = `${aiProviderName()}::${jsonMode ? 'json' : 'txt'}::${hashString(systemInstruction + '|' + prompt)}`;
+
+  if (useCache) {
+    const hit = aiCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < (options.cacheTtlMs ?? AI_CACHE_TTL_MS)) {
+      return hit.text;
+    }
+  }
+
+  let text = '';
+
+  // --- Provider 1: Gemini ---
+  if (process.env.GEMINI_API_KEY) {
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash',
+      contents: prompt,
+      config: {
+        systemInstruction,
+        ...(jsonMode ? { responseMimeType: 'application/json' } : {}),
+      },
+    });
+    text = response.text || '';
+  } else {
+    // --- Provider 2: Pollinations AI — free, keyless, OpenAI-compatible ---
+    // Anonymous tier allows 1 reply / 45 s / IP; we retry once after a short
+    // back-off and surface a clear, actionable error if still throttled.
+    const callPollinations = async (): Promise<string> => {
+      const res = await fetch(POLLINATIONS_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: 'openai',
+          referrer: 'surgitrack-ilog',
+          max_tokens: 6000,
+          reasoning_effort: 'low',
+          messages: [
+            {
+              role: 'system',
+              content:
+                systemInstruction +
+                (jsonMode ? ' Respond with ONLY a valid JSON object — no markdown fences, no commentary.' : ''),
+            },
+            { role: 'user', content: prompt },
+          ],
+        }),
+      });
+      if (!res.ok) {
+        const bodyText = await res.text().catch(() => '');
+        console.warn(`[Free AI] status ${res.status}: ${bodyText.substring(0, 300)}`);
+        const err: any = new Error(
+          res.status === 402 || res.status === 429
+            ? 'FREE_AI_RATE_LIMIT'
+            : `Free AI provider responded with status ${res.status}`
+        );
+        err.status = res.status;
+        err.body = bodyText;
+        throw err;
+      }
+      const data: any = await res.json();
+      return data?.choices?.[0]?.message?.content || '';
+    };
+
+    try {
+      text = await callPollinations();
+    } catch (err: any) {
+      if (err.message === 'FREE_AI_RATE_LIMIT') {
+        // One back-off retry (the anonymous tier window is 45 s; we wait a
+        // short moment only, then fail with guidance).
+        await sleep(3000);
+        try {
+          text = await callPollinations();
+        } catch {
+          throw new Error(
+            'FREE_AI_RATE_LIMIT: The free AI tier allows one request every ~45 seconds. Please wait a moment and try again — or set GEMINI_API_KEY (free at https://aistudio.google.com/apikey) for unlimited Gemini-powered responses.'
+          );
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  if (text && useCache) {
+    aiCache.set(cacheKey, { text, at: Date.now() });
+    // Keep the cache bounded
+    if (aiCache.size > 500) {
+      const oldest = aiCache.keys().next().value;
+      if (oldest) aiCache.delete(oldest);
+    }
+  }
+
+  return text;
 };
 
 // Endpoint 1: Draft Formal Recommendation Letter
@@ -38,8 +163,6 @@ app.post('/api/gemini/recommendation', async (req, res) => {
     if (!supervisor || !trainee || !training) {
       return res.status(400).json({ error: 'Missing required recommendation data.' });
     }
-
-    const ai = getAI();
 
     const prompt = `You are a distinguished medical professor and consultant surgeon composing a formal professional medical recommendation letter / Weiterbildungszeugnis.
 Draft the letter strictly in ${language === 'de' ? 'German (professional academic German medical terminology suitable for Ärztekammer and German hospital authorities)' : language === 'ar' ? 'Arabic (formal academic medical phrasing)' : 'English (formal international academic surgical style)'}.
@@ -83,13 +206,11 @@ Training Record Summary:
 
 Generate ONLY the formatted recommendation letter text with elegant headers, paragraphs, and closing certification block with "_________________________ [Stamp Area]".`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-    });
-
-    const text = response.text || '';
-    return res.json({ letter: text });
+    const text = await generateText(
+      prompt,
+      'You are a formal medical letter-writing assistant. You output only the finished letter.'
+    );
+    return res.json({ letter: text, provider: aiProviderName() });
   } catch (error: any) {
     console.error('Error generating recommendation letter:', error);
     return res.status(500).json({
@@ -107,23 +228,15 @@ app.post('/api/gemini/assistant', async (req, res) => {
       return res.status(400).json({ error: 'Message is required.' });
     }
 
-    const ai = getAI();
-
     const systemInstruction = `You are the SurgiTrack AI Medical Education & Terminology Assistant.
 STRICT PRIVACY RULE: You only provide generic medical educational assistance, accurate English/German/Arabic surgical terminology, grammar refinement for professional medical portfolios, blank documentation template structures, and surgical guidance.
 You NEVER process real patient names or private patient identifiers.
 If the user mentions an inquiry in English, German, or Arabic, answer accurately and professionally in that language with high clinical precision.
 Context focus: ${contextType || 'General Surgical Terminology & Translation'}. Target language: ${language || 'en'}.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: message,
-      config: {
-        systemInstruction,
-      },
-    });
+    const reply = await generateText(message, systemInstruction);
 
-    return res.json({ reply: response.text || '' });
+    return res.json({ reply, provider: aiProviderName() });
   } catch (error: any) {
     console.error('Error in medical assistant:', error);
     return res.status(500).json({
@@ -133,564 +246,304 @@ Context focus: ${contextType || 'General Surgical Terminology & Translation'}. T
 });
 
 // ==========================================
-// STRICT SERVER-SIDE EMAIL VERIFICATION SYSTEM
-// Real Clickable Verification Links • 30-Second Server-Enforced Expiration • Single-Use Security
-// NO OTP • NO Codes in UI • Real Email Delivery via Nodemailer
-// SECURITY INVARIANTS (must never be violated):
-//   1. Verification URLs and tokens are NEVER returned in any API response body.
-//   2. Verification URLs and tokens are NEVER logged to the console or any log stream.
-//   3. Verification URLs and tokens are NEVER rendered in the client UI.
-//   4. The only channel through which a token reaches the user is the SMTP email
-//      sent to the exact registered email address.
-//   5. Each token strictly expires 30 seconds after creation (server-clock enforced).
-//   6. Each token is single-use and immediately invalidated after the first click.
+// AI CASE SUGGESTIONS — Gemini-powered clinical decision support
+// Educational decision support linked to the PubMed literature engine via
+// machine-generated search terms.
+// PRIVACY: only the diagnosis text and anonymous demographics (age/sex)
+// are processed. No patient names or identifiers are ever accepted.
 // ==========================================
+app.post('/api/gemini/case-suggestions', async (req, res) => {
+  try {
+    const { diagnosis, patientAge, patientSex, specialty, language } = req.body;
 
-import nodemailer, { Transporter } from 'nodemailer';
-import crypto from 'crypto';
+    if (!diagnosis || typeof diagnosis !== 'string' || diagnosis.trim().length < 2) {
+      return res.status(400).json({ error: 'A clinical diagnosis is required.' });
+    }
 
-interface VerificationTokenRecord {
-  token: string;
-  email: string;
-  fullName: string;
-  createdAt: number;
-  expiresAt: number; // Exactly 30 seconds from createdAt
-  used: boolean;
+    // Parsed-result cache (survives the free tier rate limit gracefully)
+    const suggCacheKey = `${diagnosis.trim().toLowerCase()}|${patientAge || ''}|${patientSex || ''}|${specialty || ''}|${language || 'en'}`;
+    const suggHit = caseSuggestionsCache.get(suggCacheKey);
+    if (suggHit && Date.now() - suggHit.at < AI_CACHE_TTL_MS) {
+      return res.json(suggHit.payload);
+    }
+
+    const langName = language === 'ar' ? 'Arabic' : language === 'de' ? 'German' : 'English';
+
+    const prompt = `You are an expert academic consultant surgeon and surgical curriculum educator.
+A surgical trainee enters this working clinical diagnosis: "${diagnosis.trim()}"
+${patientAge ? `Patient age: ${patientAge}.` : ''} ${patientSex ? `Patient sex: ${patientSex}.` : ''}
+${specialty ? `Trainee specialty: ${specialty}.` : ''}
+
+Provide evidence-based educational guidance. Respond with ONLY a valid JSON object (no markdown fences, no commentary) with these keys, all values as arrays of SHORT strings (max 12 items per array), written in ${langName}:
+
+{
+  "recommendedProcedures": [],
+  "operativeSteps": [],
+  "commonComplications": [],
+  "keyInvestigations": [],
+  "redFlags": [],
+  "icd10Hints": [],
+  "pubmedSearchTerms": [],
+  "perioperativeConsiderations": []
 }
 
-// In-memory token store: Map<token, VerificationTokenRecord>
-// The token string is the ONLY key — never serialized to disk, never logged.
-const verificationTokens = new Map<string, VerificationTokenRecord>();
+Field definitions:
+- recommendedProcedures: standard operative options for this diagnosis, tagging the approach (open / laparoscopic / robotic) where relevant.
+- operativeSteps: key operative steps of the primary recommended procedure.
+- commonComplications: procedure-specific and disease-specific complications (early and late).
+- keyInvestigations: essential pre-operative work-up.
+- redFlags: urgent findings that immediately change management.
+- icd10Hints: up to 3 likely ICD-10 codes.
+- pubmedSearchTerms: 3-5 precise ENGLISH PubMed search queries to retrieve the latest evidence on this diagnosis (always English regardless of output language).
+- perioperativeConsiderations: anaesthesia, positioning, antibiotic/thromboprophylaxis and ERAS notes.
 
-// Verified emails registry (pre-verify known super admins)
-const verifiedEmailRegistry = new Set<string>([
-  'zeadmorud2030@gmail.com',
-  'zeadmorud1999@gmail.com',
-]);
+Rules:
+- Generic, textbook-level evidence-based medicine only. No invented statistics, no patient identifiers.
+- Keep each string under 120 characters.
+- If the diagnosis is ambiguous, cover the most standard textbook pathway.`;
 
-// Determine App URL for verification links (URL is composed server-side and
-// only ever leaves the server inside the private SMTP email — never returned
-// to the HTTP client and never written to logs).
-const getAppBaseUrl = (req: express.Request): string => {
-  if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
-    return process.env.APP_URL.replace(/\/$/, '');
+    const rawText = await generateText(
+      prompt,
+      'You are a surgical education AI. You output ONLY valid JSON. You never include or request patient identifiers.',
+      true,
+      { cache: false } // cached only after successful parse, below
+    );
+
+    // Robust JSON extraction: the free provider sometimes wraps the JSON in
+    // markdown fences or trailing commentary — extract the first balanced
+    // object and parse that.
+    const extractJsonObject = (s: string): string | null => {
+      const start = s.indexOf('{');
+      if (start === -1) return null;
+      let depth = 0;
+      let inString = false;
+      let escaped = false;
+      for (let i = start; i < s.length; i++) {
+        const ch = s[i];
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === '"') { inString = !inString; continue; }
+        if (inString) continue;
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) return s.substring(start, i + 1);
+        }
+      }
+      return null;
+    };
+
+    let raw = rawText.trim();
+    raw = raw.replace(/^```(json)?/i, '').replace(/```\s*$/, '').trim();
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      const extracted = extractJsonObject(rawText);
+      if (extracted) {
+        try {
+          parsed = JSON.parse(extracted);
+        } catch {
+          parsed = null;
+        }
+      } else {
+        parsed = null;
+      }
+      if (!parsed) {
+        console.warn('[Case Suggestions] Unparseable AI response:', rawText.substring(0, 300));
+        return res.status(502).json({ error: 'The AI response could not be parsed. Please try again.' });
+      }
+    }
+
+    const asStrArr = (v: any): string[] =>
+      Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim()).slice(0, 12) : [];
+
+    const payload = {
+      diagnosis: diagnosis.trim(),
+      provider: aiProviderName(),
+      recommendedProcedures: asStrArr(parsed.recommendedProcedures),
+      operativeSteps: asStrArr(parsed.operativeSteps),
+      commonComplications: asStrArr(parsed.commonComplications),
+      keyInvestigations: asStrArr(parsed.keyInvestigations),
+      redFlags: asStrArr(parsed.redFlags),
+      icd10Hints: asStrArr(parsed.icd10Hints),
+      pubmedSearchTerms: asStrArr(parsed.pubmedSearchTerms),
+      perioperativeConsiderations: asStrArr(parsed.perioperativeConsiderations),
+    };
+
+    caseSuggestionsCache.set(suggCacheKey, { payload, at: Date.now() });
+    if (caseSuggestionsCache.size > 300) {
+      const oldest = caseSuggestionsCache.keys().next().value;
+      if (oldest) caseSuggestionsCache.delete(oldest);
+    }
+
+    return res.json(payload);
+  } catch (error: any) {
+    console.error('Error generating case suggestions:', error);
+    const msg = String(error?.message || '');
+    if (msg.includes('FREE_AI_RATE_LIMIT')) {
+      return res.status(429).json({
+        error:
+          'وصلت للحد المؤقت للمزوّد المجاني (طلب واحد كل ~45 ثانية). انتظر لحظة ثم أعد المحاولة — أو اضبط GEMINI_API_KEY مجاناً من aistudio.google.com/apikey لاستجابات فورية غير محدودة عبر Gemini.',
+      });
+    }
+    return res.status(500).json({ error: msg || 'AI case suggestions unavailable.' });
   }
-  const host = req.get('host') || 'localhost:3000';
-  const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
-  return `${protocol}://${host}`;
-};
+});
 
 // ==========================================
-// EMAIL DELIVERY INFRASTRUCTURE
+// MULTI-SOURCE MEDICAL JOURNAL RESEARCH ENGINE
+// Europe PMC • Crossref (all scholarly publishers) • Cochrane Library
+// Free, key-less, server-side proxies with a unified article schema.
 // ==========================================
-// Supports three delivery modes (priority order):
-//   1. Brevo HTTP API — RECOMMENDED for Render free tier. 300 emails/day,
-//      sends to ANY recipient address (no domain verification needed).
-//      Set BREVO_API_KEY to enable. Sign up at https://www.brevo.com
-//      (free, no credit card). Get API key from SMTP & API settings.
-//   2. Resend HTTP API — also works on Render free tier (HTTPS), BUT the
-//      free tier without a verified domain only allows sending to the
-//      account owner's own email address. To send to all recipients,
-//      verify a domain at resend.com/domains. Set RESEND_API_KEY.
-//   3. SMTP (Nodemailer) — works on local dev, paid Render, Vercel,
-//      Cloud Run, etc. Set SMTP_PROVIDER/SMTP_HOST/SMTP_USER/SMTP_PASS.
-//      Does NOT work on Render free tier (outbound SMTP ports blocked).
-//
-// SECURITY: Verification URLs and tokens are NEVER returned in any API
-// response body, NEVER written to server logs, and NEVER rendered in
-// the client UI. The only delivery channel is the email itself.
+interface UnifiedArticle {
+  id: string;
+  title: string;
+  authors: string;
+  journal: string;
+  pubDate: string;
+  doi: string | null;
+  url: string;
+  fullTextUrl: string;
+  citations: number;
+  openAccess: boolean;
+  pubTypes: string[];
+  pmid?: string;
+  pmcid?: string;
+}
 
-// Determine which email delivery mode is configured (priority order).
-const getEmailMode = (): 'brevo' | 'resend' | 'smtp' | 'none' => {
-  if (process.env.BREVO_API_KEY) return 'brevo';
-  if (process.env.RESEND_API_KEY) return 'resend';
-  if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) return 'smtp';
-  return 'none';
-};
+const JOURNAL_UA = 'SurgiTrack/2.0 (medical-surgical-education; contact: scientist@surgitrack.app)';
 
-const isEmailConfigured = (): boolean => getEmailMode() !== 'none';
+app.get('/api/journals/search', async (req, res) => {
+  const term = ((req.query.term as string) || '').trim();
+  const source = (req.query.source as string) || 'europmc';
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const max = Math.min(25, Math.max(5, Number(req.query.max) || 15));
+  const sortBy = (req.query.sort as string) === 'newest' ? 'newest' : (req.query.sort as string) === 'citations' ? 'citations' : 'relevance';
 
-// Parse a "Display Name <email@domain>" formatted address into its parts.
-// Used by the Brevo API which requires sender as separate name/email fields.
-const parseFromAddress = (fromAddress: string): { name: string; email: string } => {
-  const match = fromAddress.match(/^\s*"?([^"<]*)"?\s*<([^>]+)>\s*$/);
-  if (match) {
-    return { name: match[1].trim() || 'SurgiTrack Verification', email: match[2].trim() };
-  }
-  return { name: 'SurgiTrack Verification', email: fromAddress.trim() };
-};
-
-// Create Nodemailer Transporter for SMTP mode (local dev / paid hosting).
-// Only created when needed to avoid startup errors when using HTTP API modes.
-let mailTransporter: Transporter | null = null;
-const getSmtpTransporter = (): Transporter => {
-  if (mailTransporter) return mailTransporter;
-
-  if (process.env.SMTP_PROVIDER === 'gmail' && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    mailTransporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    });
-    return mailTransporter;
+  if (!term) {
+    return res.status(400).json({ error: 'A search term is required.' });
   }
 
-  if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
-    mailTransporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port: Number(process.env.SMTP_PORT) || 587,
-      secure: process.env.SMTP_SECURE === 'true' || Number(process.env.SMTP_PORT) === 465,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-    });
-    return mailTransporter;
-  }
-
-  throw new Error('SMTP_NOT_CONFIGURED');
-};
-
-// Send email via Brevo HTTP API — works on Render free tier (HTTPS, not blocked).
-// Free tier: 300 emails/day, sends to ANY recipient (unlike Resend free tier
-// which restricts sending to the account owner's own email only).
-const sendViaBrevo = async (
-  fromAddress: string,
-  toEmail: string,
-  subject: string,
-  html: string,
-  text: string
-): Promise<void> => {
-  const sender = parseFromAddress(fromAddress);
-  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
-    method: 'POST',
-    headers: {
-      'api-key': process.env.BREVO_API_KEY!,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-    },
-    body: JSON.stringify({
-      sender: { name: sender.name, email: sender.email },
-      to: [{ email: toEmail }],
-      subject,
-      htmlContent: html,
-      textContent: text,
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => 'unknown error');
-    throw new Error(`Brevo API error (${response.status}): ${errText.substring(0, 200)}`);
-  }
-};
-
-// Send email via Resend HTTP API — works on Render free tier (HTTPS, not blocked).
-// NOTE: the Resend free tier without a verified domain only permits sending
-// to the account owner's own email address.
-const sendViaResend = async (
-  fromAddress: string,
-  toEmail: string,
-  subject: string,
-  html: string,
-  text: string
-): Promise<void> => {
-  const apiKey = process.env.RESEND_API_KEY!;
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: fromAddress,
-      to: [toEmail],
-      subject,
-      html,
-      text,
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text().catch(() => 'unknown error');
-    throw new Error(`Resend API error (${response.status}): ${errText.substring(0, 200)}`);
-  }
-};
-
-// Emit a one-time startup diagnostic about email readiness.
-(() => {
-  const mode = getEmailMode();
-  if (mode === 'brevo') {
-    console.log('[SurgiTrack Mailer] Brevo HTTP API is configured and ready. (Render free-tier compatible, sends to any recipient)');
-  } else if (mode === 'resend') {
-    console.log('[SurgiTrack Mailer] Resend HTTP API is configured. NOTE: Resend free tier only sends to the account owner\'s own email — use BREVO_API_KEY to send to all recipients.');
-  } else if (mode === 'smtp') {
-    console.log('[SurgiTrack Mailer] SMTP delivery is configured. NOTE: SMTP does NOT work on Render free tier — use BREVO_API_KEY instead.');
-  } else {
-    console.warn('[SurgiTrack Mailer] WARNING: No email delivery configured. Set BREVO_API_KEY (recommended — sends to any recipient) or RESEND_API_KEY or SMTP_* env vars — see .env.example.');
-  }
-})();
-
-// Shared helper: dispatch the verification email to the EXACT registered email.
-// Returns true on successful delivery, throws on failure. NEVER returns the
-// token or URL — those stay strictly server-side.
-//
-// EMAIL FORMAT (as specified by product owner):
-//   From:    SurgiTrack Verification <noreply@surgitrack.com>
-//   Subject: Verify your SurgiTrack account:
-//   Body:    Welcome to SurgiTrack iLog.
-//            Please verify your email address to activate your account.
-//            [Verify Account button → verificationUrl]
-//            This is an automated security message.
-const dispatchVerificationEmail = async (
-  toEmail: string,
-  displayName: string,
-  verificationUrl: string,
-  isResend: boolean
-): Promise<void> => {
-  // Unified subject line for both initial registration and resend flows.
-  const subject = 'Verify your SurgiTrack account:';
-
-  // Clean, minimal HTML body that matches the requested format exactly.
-  // The verification button is the only interactive element — the link URL
-  // is never rendered as plain text in the email body.
-  const mailHtml = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Verify your SurgiTrack account</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f1f5f9; margin: 0; padding: 24px; }
-    .container { max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 16px; overflow: hidden; border: 1px solid #cbd5e1; }
-    .header { background: #101C32; padding: 24px; text-align: center; border-bottom: 3px solid #0D9488; }
-    .title { color: #ffffff; font-size: 19px; font-weight: 800; margin: 0; }
-    .title .accent { color: #2dd4bf; }
-    .content { padding: 32px 28px; color: #334155; font-size: 14px; line-height: 1.7; }
-    .greeting { font-size: 15px; font-weight: 700; color: #0f172a; margin-bottom: 14px; }
-    .message { margin: 0 0 22px 0; color: #334155; }
-    .btn-container { text-align: center; margin: 26px 0; }
-    .btn { display: inline-block; background: #0D9488; color: #ffffff !important; text-decoration: none; font-weight: 700; font-size: 15px; padding: 14px 36px; border-radius: 12px; box-shadow: 0 4px 12px rgba(13, 148, 136, 0.3); }
-    .btn:hover { background: #0f766e; }
-    .meta { color: #94a3b8; font-size: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid #e2e8f0; }
-    .automated { color: #64748b; font-size: 12px; font-style: italic; margin-top: 16px; }
-    .footer { background: #f8fafc; padding: 18px; text-align: center; font-size: 11px; color: #64748b; border-top: 1px solid #e2e8f0; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1 class="title">SurgiTrack <span class="accent">iLog</span></h1>
-    </div>
-    <div class="content">
-      <div class="greeting">Welcome to SurgiTrack iLog.</div>
-      <p class="message">Please verify your email address to activate your account.</p>
-      <div class="btn-container">
-        <a href="${verificationUrl}" class="btn">Verify Account</a>
-      </div>
-      <p class="automated">This is an automated security message.</p>
-      <div class="meta">
-        <strong>Security notice:</strong> This verification link is valid for 30 seconds and can only be used once. If you did not create a SurgiTrack account, you can safely ignore this email.
-      </div>
-    </div>
-    <div class="footer">
-      SurgiTrack iLog &mdash; Professional Surgical Training &amp; Clinical Portfolio
-    </div>
-  </div>
-</body>
-</html>`;
-
-  // Plain-text fallback. The verification URL IS included here because
-  // plain-text clients cannot render the HTML button — without the URL,
-  // the recipient would have no way to verify. This text body is sent
-  // only inside the private SMTP email; it is never exposed in the UI
-  // or any API response.
-  const mailText = `Welcome to SurgiTrack iLog.
-
-Please verify your email address to activate your account.
-
-Open the following link in your browser to verify your account (valid for 30 seconds, single use):
-${verificationUrl}
-
-This is an automated security message.
-
----
-SurgiTrack iLog - Professional Surgical Training & Clinical Portfolio
-If you did not create a SurgiTrack account, you can safely ignore this email.`;
-
-  // Sender address. When using Resend with a verified domain, this can be
-  // noreply@surgitrack.com. On the Resend free tier (no domain verified),
-  // use onboarding@resend.dev. Override via SMTP_FROM env var.
-  const fromAddress = process.env.SMTP_FROM || '"SurgiTrack Verification" <noreply@surgitrack.com>';
-
-  // Dispatch via the configured delivery mode (Brevo, Resend HTTP API, or SMTP).
-  // Surfaces a thrown error on failure so the calling endpoint can return
-  // a clear failure to the user without ever exposing the token or URL.
   try {
-    const mode = getEmailMode();
-    if (mode === 'brevo') {
-      await sendViaBrevo(fromAddress, toEmail, subject, mailHtml, mailText);
-    } else if (mode === 'resend') {
-      await sendViaResend(fromAddress, toEmail, subject, mailHtml, mailText);
-    } else if (mode === 'smtp') {
-      const transporter = getSmtpTransporter();
-      await transporter.sendMail({
-        from: fromAddress,
-        to: toEmail,
-        subject,
-        html: mailHtml,
-        text: mailText,
+    let results: UnifiedArticle[] = [];
+    let totalCount = 0;
+
+    if (source === 'europmc') {
+      let query = term;
+      if (sortBy === 'newest') query = `${term} SORT_PDATE:D`;
+      if (sortBy === 'citations') query = `${term} SORT_CITED:y`;
+      const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(query)}&format=json&pageSize=${max}&page=${page}`;
+      const r = await fetch(url, { headers: { 'User-Agent': JOURNAL_UA } });
+      if (!r.ok) throw new Error(`Europe PMC responded with status ${r.status}`);
+      const data: any = await r.json();
+      totalCount = Number(data?.hitCount) || 0;
+      results = (data?.resultList?.result || []).map((a: any): UnifiedArticle => ({
+        id: `${a.source}:${a.id}`,
+        pmid: a.pmid || undefined,
+        pmcid: a.pmcid || undefined,
+        title: a.title || 'Untitled Article',
+        authors: (a.authorString || 'Research Group').split(',').slice(0, 4).join(', '),
+        journal: a.journalTitle || a.bookOrReportDetails?.publisher || 'Europe PMC',
+        pubDate: a.firstPublicationDate || a.pubYear || 'N/A',
+        doi: a.doi || null,
+        url: a.pmid ? `https://europepmc.org/article/MED/${a.pmid}` : (a.doi ? `https://doi.org/${a.doi}` : 'https://europepmc.org'),
+        fullTextUrl: a.pmcid ? `https://europepmc.org/article/${a.source}/${a.pmcid}` : (a.doi ? `https://doi.org/${a.doi}` : ''),
+        citations: Number(a.citedByCount) || 0,
+        openAccess: a.isOpenAccess === 'Y',
+        pubTypes: String(a.pubType || '').split(';').map((s: string) => s.trim()).filter(Boolean),
+      }));
+    } else if (source === 'crossref' || source === 'cochrane') {
+      const params = new URLSearchParams({
+        query: term,
+        rows: String(max),
+        offset: String((page - 1) * max),
+        select: 'title,author,container-title,issued,DOI,URL,type,volume,issue,page,is-referenced-by-count',
+        filter: 'type:journal-article',
+      });
+      if (source === 'cochrane') {
+        params.set('query.container-title', 'Cochrane Database of Systematic Reviews');
+      }
+      if (sortBy === 'newest') {
+        params.set('sort', 'published');
+        params.set('order', 'desc');
+      } else if (sortBy === 'citations') {
+        params.set('sort', 'is-referenced-by-count');
+        params.set('order', 'desc');
+      }
+      const url = `https://api.crossref.org/works?${params.toString()}`;
+      const r = await fetch(url, { headers: { 'User-Agent': JOURNAL_UA } });
+      if (!r.ok) throw new Error(`Crossref responded with status ${r.status}`);
+      const data: any = await r.json();
+      totalCount = Number(data?.message?.['total-results']) || 0;
+      results = (data?.message?.items || []).map((it: any, idx: number): UnifiedArticle => {
+        const year = it.issued?.['date-parts']?.[0]?.[0];
+        return {
+          id: `cr:${it.DOI || `${page}-${idx}`}`,
+          title: (Array.isArray(it.title) ? it.title[0] : it.title) || 'Untitled Article',
+          authors: Array.isArray(it.author)
+            ? it.author.slice(0, 4).map((a: any) => `${a.family || ''}${a.given ? ', ' + a.given : ''}`.trim()).join('; ') + (it.author.length > 4 ? ' et al.' : '')
+            : 'Research Group',
+          journal: (Array.isArray(it['container-title']) ? it['container-title'][0] : it['container-title']) || 'Scholarly Journal',
+          pubDate: year ? String(year) : 'N/A',
+          doi: it.DOI || null,
+          url: it.URL || (it.DOI ? `https://doi.org/${it.DOI}` : ''),
+          fullTextUrl: it.DOI ? `https://doi.org/${it.DOI}` : (it.URL || ''),
+          citations: Number(it['is-referenced-by-count']) || 0,
+          openAccess: /cochrane/i.test(String(Array.isArray(it['container-title']) ? it['container-title'][0] : it['container-title'] || '')),
+          pubTypes: [it.type || 'journal-article'],
+        };
       });
     } else {
-      throw new Error('EMAIL_NOT_CONFIGURED');
+      return res.status(400).json({ error: 'Unknown source. Use europmc, crossref or cochrane.' });
     }
-    // Log ONLY delivery success + the recipient email. NEVER log the token or URL.
-    console.log(`[SurgiTrack Mailer] Verification link dispatched to ${toEmail} via ${mode}`);
-  } catch (mailErr: any) {
-    // NEVER log the verification URL or token — only the error message string.
-    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
-    console.warn(`[SurgiTrack Mailer] Real mail delivery FAILED for ${toEmail}: ${safeErr}`);
-    throw mailErr;
-  }
-};
 
-// Endpoint: Send Real Verification Link (30-second expiration)
-// SECURITY: This endpoint NEVER returns the token or verification URL in the
-// response body. The only delivery channel for the link is the private SMTP
-// email sent to the exact registered email address. If SMTP delivery fails,
-// we return a clear error so the user can retry — never a false "success".
-app.post('/api/auth/send-verification-link', async (req, res) => {
-  const { email, fullName } = req.body;
-  if (!email || typeof email !== 'string' || !email.includes('@')) {
-    return res.status(400).json({ error: 'Valid registered email address is required.' });
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-  const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
-
-  // Hard requirement: email delivery must be configured (Resend or SMTP).
-  if (!isEmailConfigured()) {
-    return res.status(503).json({
-      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator to configure RESEND_API_KEY or SMTP credentials.',
+    return res.json({
+      query: term,
+      source,
+      totalCount,
+      page,
+      totalPages: Math.max(1, Math.ceil(totalCount / max)),
+      pageSize: max,
+      sort: sortBy,
+      results,
+      lastSyncDate: new Date().toISOString(),
     });
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Journal search failed.' });
   }
+});
 
-  // Invalidate any existing unused tokens for this email (only one active link per email)
-  for (const [t, rec] of verificationTokens.entries()) {
-    if (rec.email === cleanEmail && !rec.used) {
-      verificationTokens.delete(t);
-    }
+// Full abstract & MeSH details for a Europe PMC article (id format "MED:12345")
+app.get('/api/journals/abstract', async (req, res) => {
+  const id = String(req.query.id || '').trim();
+  if (!id || !id.includes(':')) {
+    return res.status(400).json({ error: 'Article id is required (format SOURCE:ID).' });
   }
-
-  // Generate cryptographically secure 256-bit unique token
-  const token = crypto.randomBytes(32).toString('hex');
-  const now = Date.now();
-  const expiresAt = now + 30 * 1000; // STRICT 30 SECONDS
-
-  const record: VerificationTokenRecord = {
-    token,
-    email: cleanEmail,
-    fullName: displayName,
-    createdAt: now,
-    expiresAt,
-    used: false,
-  };
-
-  verificationTokens.set(token, record);
-
-  // Compose the verification URL — STRICTLY server-side. This URL is never
-  // returned in the HTTP response and is never written to logs. It only
-  // leaves the server inside the private SMTP email below.
-  const baseUrl = getAppBaseUrl(req);
-  const verificationUrl = `${baseUrl}/api/auth/verify-link?token=${token}`;
-
-  // Dispatch the real SMTP email to the EXACT registered address.
-  // On failure we MUST invalidate the freshly-created token so it cannot
-  // be brute-forced later, and we MUST return a clear error to the user
-  // (without ever exposing the token).
+  const [src, extId] = id.split(':');
   try {
-    await dispatchVerificationEmail(cleanEmail, displayName, verificationUrl, false);
-  } catch (mailErr: any) {
-    // Invalidate the token — never leave a "live" token if its delivery failed.
-    verificationTokens.delete(token);
-
-    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
-    if (safeErr === 'SMTP_NOT_CONFIGURED' || safeErr === 'EMAIL_NOT_CONFIGURED') {
-      return res.status(503).json({
-        error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
-      });
+    const url = `https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=${encodeURIComponent(`SRC:${src} AND EXT_ID:${extId}`)}&resultType=core&format=json`;
+    const r = await fetch(url, { headers: { 'User-Agent': JOURNAL_UA } });
+    if (!r.ok) throw new Error(`Europe PMC responded with status ${r.status}`);
+    const data: any = await r.json();
+    const art = data?.resultList?.result?.[0];
+    if (!art) {
+      return res.status(404).json({ error: 'Abstract not found for this article.' });
     }
-    return res.status(502).json({
-      error: 'We could not deliver the verification email at this time. Please wait a moment and try again.',
+    return res.json({
+      title: art.title || '',
+      authors: art.authorString || '',
+      journal: art.journalTitle || '',
+      pubDate: art.firstPublicationDate || art.pubYear || '',
+      abstract: art.abstractText || '',
+      keywords: (art.keywordList?.keyword || []).slice(0, 15),
+      meshTerms: (art.meshHeadingList?.meshHeading || []).map((m: any) => m.descriptorName || '').slice(0, 20),
+      doi: art.doi || null,
     });
+  } catch (err: any) {
+    return res.status(502).json({ error: err.message || 'Abstract fetch failed.' });
   }
-
-  // Return success — without EVER exposing the token or URL in the response.
-  return res.json({
-    success: true,
-    message: 'Verification link sent directly to your registered email address.',
-    expiresInSeconds: 30,
-  });
-});
-
-// Endpoint: Validate Verification Link (30-Second Server-Enforced Expiration & Single-Use)
-app.get('/api/auth/verify-link', (req, res) => {
-  const token = String(req.query.token || '').trim();
-
-  const renderPage = (title: string, message: string, isSuccess: boolean, redirectUrl?: string) => {
-    return `
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>${title} - SurgiTrack iLog</title>
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0c1424; color: #f8fafc; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-          .card { background: #101C32; border: 1px solid ${isSuccess ? '#0D9488' : '#ef4444'}; border-radius: 24px; padding: 36px 30px; max-width: 480px; width: 100%; text-align: center; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); }
-          .icon { width: 64px; height: 64px; border-radius: 20px; background: ${isSuccess ? 'rgba(13, 148, 136, 0.2)' : 'rgba(239, 68, 68, 0.2)'}; color: ${isSuccess ? '#2dd4bf' : '#f87171'}; display: inline-flex; align-items: center; justify-content: center; font-size: 32px; margin-bottom: 20px; }
-          h1 { font-size: 20px; margin: 0 0 12px 0; color: #ffffff; }
-          p { font-size: 14px; line-height: 1.6; color: #94a3b8; margin: 0 0 24px 0; }
-          .btn { display: inline-block; background: ${isSuccess ? '#0D9488' : '#334155'}; color: #ffffff; text-decoration: none; font-weight: 700; font-size: 14px; padding: 12px 28px; border-radius: 12px; transition: background 0.2s; }
-          .btn:hover { background: ${isSuccess ? '#0f766e' : '#475569'}; }
-          .brand { margin-top: 24px; font-size: 11px; color: #64748b; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <div class="icon">${isSuccess ? '✓' : '⚠'}</div>
-          <h1>${title}</h1>
-          <p>${message}</p>
-          <a href="${redirectUrl || '/'}" class="btn">${isSuccess ? 'Continue to SurgiTrack iLog' : 'Return to Login Screen'}</a>
-          <div class="brand">SurgiTrack iLog • Secure Verification System</div>
-        </div>
-      </body>
-      </html>
-    `;
-  };
-
-  if (!token) {
-    return res.status(400).send(renderPage('Missing Verification Token', 'The link does not contain a valid security verification token.', false));
-  }
-
-  const record = verificationTokens.get(token);
-
-  if (!record) {
-    return res.status(400).send(renderPage('Invalid or Expired Link', 'This verification link is invalid, already used, or does not exist. Please request a new verification link from the SurgiTrack app.', false));
-  }
-
-  if (record.used) {
-    return res.status(400).send(renderPage('Link Already Used', 'This verification link has already been used. Each verification link can only be clicked once.', false));
-  }
-
-  const now = Date.now();
-  const elapsedMs = now - record.createdAt;
-
-  // STRICT 30-SECOND EXPIRATION ENFORCED BY SERVER CLOCK
-  if (elapsedMs > 30 * 1000) {
-    // Invalidate token
-    record.used = true;
-    verificationTokens.delete(token);
-    return res.status(400).send(renderPage(
-      'Verification Link Expired (30-Second Limit Exceeded)',
-      `This verification link expired after 30 seconds for surgical security compliance (received after ${Math.round(elapsedMs / 1000)}s). Please return to the login screen and click "Resend Verification Link".`,
-      false
-    ));
-  }
-
-  // Token is valid and within 30 seconds!
-  record.used = true;
-  verificationTokens.delete(token); // Single-use guarantee
-  verifiedEmailRegistry.add(record.email);
-
-  const redirectUrl = `/?verified=true&email=${encodeURIComponent(record.email)}`;
-  return res.send(renderPage(
-    'Email Successfully Verified!',
-    `Your SurgiTrack iLog account for <strong>${record.email}</strong> is now verified and active. You have full access to your clinical portfolio and logbook.`,
-    true,
-    redirectUrl
-  ));
-});
-
-// Endpoint: Check Verification Status for an Email
-app.get('/api/auth/verification-status', (req, res) => {
-  const email = String(req.query.email || '').trim().toLowerCase();
-  if (!email) {
-    return res.status(400).json({ verified: false, error: 'Email parameter required.' });
-  }
-
-  const isVerified = verifiedEmailRegistry.has(email);
-  return res.json({
-    email,
-    verified: isVerified,
-  });
-});
-
-// Endpoint: Resend Verification Link
-app.post('/api/auth/resend-verification', async (req, res) => {
-  const { email, fullName } = req.body;
-  if (!email || typeof email !== 'string') {
-    return res.status(400).json({ error: 'Valid registered email address is required.' });
-  }
-
-  const cleanEmail = email.trim().toLowerCase();
-  const displayName = (fullName && typeof fullName === 'string') ? fullName.trim() : 'Surgeon Trainee';
-
-  // Hard requirement: email delivery must be configured (Resend or SMTP).
-  if (!isEmailConfigured()) {
-    return res.status(503).json({
-      error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
-    });
-  }
-
-  // Invalidate any existing unused tokens for this email (only one active link per email)
-  for (const [t, rec] of verificationTokens.entries()) {
-    if (rec.email === cleanEmail && !rec.used) {
-      verificationTokens.delete(t);
-    }
-  }
-
-  const token = crypto.randomBytes(32).toString('hex');
-  const now = Date.now();
-  const expiresAt = now + 30 * 1000; // STRICT 30 SECONDS
-
-  const record: VerificationTokenRecord = {
-    token,
-    email: cleanEmail,
-    fullName: displayName,
-    createdAt: now,
-    expiresAt,
-    used: false,
-  };
-
-  verificationTokens.set(token, record);
-
-  // Verification URL composed STRICTLY server-side. Never returned in the
-  // HTTP response, never logged. Only embedded inside the private SMTP email.
-  const baseUrl = getAppBaseUrl(req);
-  const verificationUrl = `${baseUrl}/api/auth/verify-link?token=${token}`;
-
-  // Dispatch via real SMTP — surface failure as a clear error (never the token).
-  try {
-    await dispatchVerificationEmail(cleanEmail, displayName, verificationUrl, true);
-  } catch (mailErr: any) {
-    // Invalidate the freshly-created token — never leave a "live" token if
-    // its delivery failed.
-    verificationTokens.delete(token);
-
-    const safeErr = String(mailErr?.message || mailErr || 'unknown mail error');
-    if (safeErr === 'SMTP_NOT_CONFIGURED' || safeErr === 'EMAIL_NOT_CONFIGURED') {
-      return res.status(503).json({
-        error: 'Email delivery is not configured on the server. Please contact the SurgiTrack administrator.',
-      });
-    }
-    return res.status(502).json({
-      error: 'We could not deliver the verification email at this time. Please wait a moment and try again.',
-    });
-  }
-
-  // Return success — without EVER exposing the token or URL in the response.
-  return res.json({
-    success: true,
-    message: 'A fresh verification link has been sent to your registered email address.',
-    expiresInSeconds: 30,
-  });
 });
 
 // Helper to assign high-yield clinical imagery based on category & title keywords

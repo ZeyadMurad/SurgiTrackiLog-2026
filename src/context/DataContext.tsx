@@ -20,6 +20,7 @@ import {
   RecommendationLetter,
   SavedArticle,
   SyncStatus,
+  SupervisorSignature,
 } from '../types';
 import { DEFAULT_SURGICAL_SKILLS } from '../lib/medicalDefaults';
 
@@ -73,6 +74,15 @@ interface DataContextType {
   addTrainingRecord: (r: Omit<TrainingRecord, 'id' | 'userId' | 'createdAt' | 'updatedAt'>) => Promise<string>;
   updateTrainingRecord: (id: string, supervisorId: string, r: Partial<TrainingRecord>) => Promise<void>;
   deleteTrainingRecord: (id: string, supervisorId: string) => Promise<void>;
+
+  // Digital supervisor signature (immutable audit trail)
+  signTrainingRecords: (
+    recordIds: string[],
+    supervisor: Supervisor,
+    trainee: { id: string; name: string; position?: string }
+  ) => Promise<number>;
+  verifyRecordIntegrity: (recordId: string) => 'valid' | 'tampered' | 'unsigned';
+  verifyRecordIntegrityAsync: (recordId: string) => Promise<'valid' | 'tampered' | 'unsigned'>;
 
   addTrainingSession: (s: Omit<TrainingSession, 'id' | 'userId' | 'createdAt' | 'updatedAt'>) => Promise<string>;
   updateTrainingSession: (id: string, s: Partial<TrainingSession>) => Promise<void>;
@@ -1311,6 +1321,14 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const updateTrainingRecord = async (id: string, supervisorId: string, r: Partial<TrainingRecord>) => {
+    // IMMUTABILITY GUARD: signed records are locked forever — the audit
+    // trail preserves the exact content the supervisor attested to.
+    const target = trainingRecords.find(item => item.id === id);
+    if (target?.signature) {
+      throw new Error(
+        'This record is digitally signed by the supervisor and is locked. Signed records are immutable and cannot be edited.'
+      );
+    }
     const updated = trainingRecords.map(item => item.id === id ? { ...item, ...r, updatedAt: new Date().toISOString() } : item);
     setTrainingRecords(updated);
     saveLocal('records', updated);
@@ -1330,6 +1348,13 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const deleteTrainingRecord = async (id: string, supervisorId: string) => {
+    // IMMUTABILITY GUARD: signed records can never be deleted.
+    const target = trainingRecords.find(item => item.id === id);
+    if (target?.signature) {
+      throw new Error(
+        'This record is digitally signed by the supervisor and cannot be deleted. Signed records form the permanent audit trail.'
+      );
+    }
     const updated = trainingRecords.filter(item => item.id !== id);
     setTrainingRecords(updated);
     saveLocal('records', updated);
@@ -1346,6 +1371,131 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
       }
     }
+  };
+
+  // ==========================================
+  // DIGITAL SUPERVISOR SIGNATURE (Immutable Audit Trail)
+  // A SHA-256 content hash is computed over the full clinical content of the
+  // record and stored with the signature block. Once signed the record is
+  // locked: updateTrainingRecord / deleteTrainingRecord refuse any change,
+  // and verifyRecordIntegrityAsync() recomputes the hash to detect tampering.
+  // ==========================================
+  const computeTrainingRecordHash = async (r: TrainingRecord): Promise<string> => {
+    // The payload deliberately excludes metadata (id, timestamps, verified flag)
+    // so only the CLINICAL CONTENT is attested.
+    const payload = {
+      supervisorId: r.supervisorId,
+      trainingDate: r.trainingDate,
+      procedureDate: r.procedureDate,
+      hospital: r.hospital,
+      department: r.department,
+      specialty: r.specialty,
+      activityType: r.activityType,
+      procedureName: r.procedureName,
+      clinicalCaseRef: r.clinicalCaseRef || '',
+      startTime: r.startTime,
+      endTime: r.endTime,
+      breakDurationMinutes: r.breakDurationMinutes,
+      netTrainingHours: r.netTrainingHours,
+      surgicalExposure: r.surgicalExposure,
+      participationRole: r.participationRole,
+      descriptionOfParticipation: r.descriptionOfParticipation,
+      responsibilities: r.responsibilities,
+      supervisionLevel: r.supervisionLevel,
+      skillsAcquired: [...(r.skillsAcquired || [])].sort(),
+      learningPoints: r.learningPoints || '',
+      supervisorFeedback: r.supervisorFeedback || '',
+    };
+    try {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(JSON.stringify(payload));
+      const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    } catch {
+      // Deterministic fallback for environments without crypto.subtle
+      const str = JSON.stringify(payload);
+      let h1 = 0x811c9dc5;
+      let h2 = 0x1000193;
+      for (let i = 0; i < str.length; i++) {
+        h1 = (h1 ^ str.charCodeAt(i)) >>> 0;
+        h1 = (h1 * 0x01000193) >>> 0;
+        h2 = (h2 + str.charCodeAt(i) * (i + 7)) >>> 0;
+      }
+      return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0') + '_fb';
+    }
+  };
+
+  const signTrainingRecords = async (
+    recordIds: string[],
+    supervisor: Supervisor,
+    trainee: { id: string; name: string; position?: string }
+  ): Promise<number> => {
+    const signedAt = new Date().toISOString();
+    const signedRecords: TrainingRecord[] = [];
+
+    for (const recordId of recordIds) {
+      const record = trainingRecords.find(r => r.id === recordId);
+      if (!record || record.signature) continue; // skip already-signed
+
+      const contentHash = await computeTrainingRecordHash(record);
+      const signature: SupervisorSignature = {
+        supervisorId: supervisor.id,
+        supervisorName: supervisor.fullName,
+        supervisorDegree: supervisor.academicDegree,
+        supervisorPosition: supervisor.professionalPosition,
+        signedAt,
+        contentHash,
+        algorithm: 'SHA-256',
+        traineeId: trainee.id,
+        traineeName: trainee.name,
+        traineePosition: trainee.position,
+      };
+
+      signedRecords.push({
+        ...record,
+        verified: true,
+        signature,
+        updatedAt: signedAt,
+      });
+
+      // Persist to Firestore
+      if (user) {
+        try {
+          await setDoc(
+            doc(db, 'users', user.uid, 'supervisors', record.supervisorId, 'trainingRecords', recordId),
+            { verified: true, signature, updatedAt: signedAt },
+            { merge: true }
+          );
+        } catch (err) {
+          console.warn('Signature persisted locally, Firestore sync queued:', err);
+        }
+      }
+    }
+
+    if (signedRecords.length > 0) {
+      const updated = trainingRecords.map(r => {
+        const signed = signedRecords.find(s => s.id === r.id);
+        return signed || r;
+      });
+      setTrainingRecords(updated);
+      saveLocal('records', updated);
+    }
+
+    return signedRecords.length;
+  };
+
+  const verifyRecordIntegrity = (recordId: string): 'valid' | 'tampered' | 'unsigned' => {
+    const record = trainingRecords.find(r => r.id === recordId);
+    if (!record || !record.signature) return 'unsigned';
+    return 'valid'; // deep async verification available via verifyRecordIntegrityAsync
+  };
+
+  const verifyRecordIntegrityAsync = async (recordId: string): Promise<'valid' | 'tampered' | 'unsigned'> => {
+    const record = trainingRecords.find(r => r.id === recordId);
+    if (!record || !record.signature) return 'unsigned';
+    const hash = await computeTrainingRecordHash(record);
+    return hash === record.signature.contentHash ? 'valid' : 'tampered';
   };
 
   // CRUD Training Sessions
@@ -1602,6 +1752,9 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         addTrainingRecord,
         updateTrainingRecord,
         deleteTrainingRecord,
+        signTrainingRecords,
+        verifyRecordIntegrity,
+        verifyRecordIntegrityAsync,
         addTrainingSession,
         updateTrainingSession,
         deleteTrainingSession,

@@ -479,8 +479,7 @@ export const ClinicalCasesView: React.FC = () => {
                           <img
                             src={att.url}
                             alt={att.title}
-                            className="w-full h-28 object-cover cursor-pointer hover:scale-105 transition"
-                            onClick={() => window.open ? undefined : null}
+                            className="w-full h-28 object-cover hover:scale-105 transition"
                           />
                         ) : (
                           <div className="w-full h-28 flex flex-col items-center justify-center bg-slate-100 text-slate-500">
