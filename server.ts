@@ -269,12 +269,12 @@ app.post('/api/gemini/case-suggestions', async (req, res) => {
 
     const langName = language === 'ar' ? 'Arabic' : language === 'de' ? 'German' : 'English';
 
-    const prompt = `You are an expert academic consultant surgeon and surgical curriculum educator.
+    const buildPrompt = (compact: boolean) => `You are an expert academic consultant surgeon and surgical curriculum educator.
 A surgical trainee enters this working clinical diagnosis: "${diagnosis.trim()}"
 ${patientAge ? `Patient age: ${patientAge}.` : ''} ${patientSex ? `Patient sex: ${patientSex}.` : ''}
 ${specialty ? `Trainee specialty: ${specialty}.` : ''}
 
-Provide evidence-based educational guidance. Respond with ONLY a valid JSON object (no markdown fences, no commentary) with these keys, all values as arrays of SHORT strings (max 12 items per array), written in ${langName}:
+Provide evidence-based educational guidance. Respond with ONLY a valid JSON object (no markdown fences, no commentary) with these keys, all values as arrays of SHORT strings${compact ? ' (max 3 items per array, each under 70 characters)' : ' (max 5 items per array, each under 90 characters)'}, written in ${langName}:
 
 {
   "recommendedProcedures": [],
@@ -294,24 +294,14 @@ Field definitions:
 - keyInvestigations: essential pre-operative work-up.
 - redFlags: urgent findings that immediately change management.
 - icd10Hints: up to 3 likely ICD-10 codes.
-- pubmedSearchTerms: 3-5 precise ENGLISH PubMed search queries to retrieve the latest evidence on this diagnosis (always English regardless of output language).
+- pubmedSearchTerms: 3 precise ENGLISH PubMed search queries to retrieve the latest evidence on this diagnosis (always English regardless of output language).
 - perioperativeConsiderations: anaesthesia, positioning, antibiotic/thromboprophylaxis and ERAS notes.
 
 Rules:
 - Generic, textbook-level evidence-based medicine only. No invented statistics, no patient identifiers.
-- Keep each string under 120 characters.
+- CRITICAL: output the COMPLETE JSON object — never truncate. If unsure, use fewer items rather than cutting the JSON short.
 - If the diagnosis is ambiguous, cover the most standard textbook pathway.`;
 
-    const rawText = await generateText(
-      prompt,
-      'You are a surgical education AI. You output ONLY valid JSON. You never include or request patient identifiers.',
-      true,
-      { cache: false } // cached only after successful parse, below
-    );
-
-    // Robust JSON extraction: the free provider sometimes wraps the JSON in
-    // markdown fences or trailing commentary — extract the first balanced
-    // object and parse that.
     const extractJsonObject = (s: string): string | null => {
       const start = s.indexOf('{');
       if (start === -1) return null;
@@ -333,27 +323,40 @@ Rules:
       return null;
     };
 
-    let raw = rawText.trim();
-    raw = raw.replace(/^```(json)?/i, '').replace(/```\s*$/, '').trim();
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      const extracted = extractJsonObject(rawText);
+    const tryParse = (text: string): any | null => {
+      let raw = text.trim().replace(/^```(json)?/i, '').replace(/```\s*$/, '').trim();
+      try {
+        return JSON.parse(raw);
+      } catch {
+        /* fall through */
+      }
+      const extracted = extractJsonObject(text);
       if (extracted) {
         try {
-          parsed = JSON.parse(extracted);
+          return JSON.parse(extracted);
         } catch {
-          parsed = null;
+          /* fall through */
         }
-      } else {
-        parsed = null;
       }
-      if (!parsed) {
-        console.warn('[Case Suggestions] Unparseable AI response:', rawText.substring(0, 300));
-        return res.status(502).json({ error: 'The AI response could not be parsed. Please try again.' });
-      }
+      return null;
+    };
+
+    const SYSTEM_SUGGESTIONS =
+      'You are a surgical education AI. You output ONLY valid JSON. You never include or request patient identifiers.';
+
+    // Attempt 1: full prompt; Attempt 2 (on parse failure): compact mode —
+    // the free provider can truncate long outputs, compact requests don't.
+    let parsed = tryParse(await generateText(buildPrompt(false), SYSTEM_SUGGESTIONS, true, { cache: false }));
+
+    if (!parsed) {
+      console.warn('[Case Suggestions] Retrying in compact mode...');
+      await sleep(1500);
+      parsed = tryParse(await generateText(buildPrompt(true), SYSTEM_SUGGESTIONS, true, { cache: false }));
+    }
+
+    if (!parsed) {
+      console.warn('[Case Suggestions] Unparseable AI response after compact retry.');
+      return res.status(502).json({ error: 'The AI response could not be parsed. Please try again.' });
     }
 
     const asStrArr = (v: any): string[] =>
