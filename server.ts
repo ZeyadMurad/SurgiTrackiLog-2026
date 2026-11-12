@@ -33,8 +33,30 @@ app.use(express.json({ limit: '10mb' }));
 const POLLINATIONS_URL = 'https://text.pollinations.ai/openai';
 const AI_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+// ============================================================
+// MODEL ROUTING — "instant AND highest quality"
+//   • gemini-3.8-flash  → interactive features (case suggestions,
+//                         assistant chat): fastest smart Flash model
+//                         with thinkingBudget=0 for instant replies.
+//   • gemini-4-argon    → formal recommendation letters: flagship
+//                         reasoning model for highest-quality long-form
+//                         medical prose (thinkingBudget=-1, dynamic).
+// Both are valid model IDs as of Nov 2026 (aistudio.google.com/docs/models).
+// ============================================================
+const MODEL_FAST = process.env.GEMINI_MODEL_FAST || 'gemini-3.8-flash';
+const MODEL_PRO = process.env.GEMINI_MODEL_PRO || 'gemini-4-argon';
+
 const aiProviderName = (): 'gemini' | 'pollinations-free' =>
   process.env.GEMINI_API_KEY ? 'gemini' : 'pollinations-free';
+
+// Reusable Gemini client (instantiated once, reused across requests —
+// avoids paying SDK init / connection cost on every API call).
+let _geminiClient: InstanceType<typeof GoogleGenAI> | null = null;
+const getGeminiClient = (): InstanceType<typeof GoogleGenAI> => {
+  if (_geminiClient) return _geminiClient;
+  _geminiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+  return _geminiClient;
+};
 
 // Simple in-memory response cache: hash(prompt) -> { text, at }
 const aiCache = new Map<string, { text: string; at: number }>();
@@ -53,14 +75,23 @@ const hashString = (s: string): string => {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+interface GenerateOptions {
+  cache?: boolean;
+  cacheTtlMs?: number;
+  model?: 'fast' | 'pro';          // pick MODEL_FAST or MODEL_PRO
+  thinkingBudget?: number;         // 0 = instant (no thinking), -1 = dynamic (full quality)
+  abortSignal?: AbortSignal;
+}
+
 const generateText = async (
   prompt: string,
   systemInstruction: string,
   jsonMode = false,
-  options: { cache?: boolean; cacheTtlMs?: number } = {}
+  options: GenerateOptions = {}
 ): Promise<string> => {
   const useCache = options.cache !== false;
-  const cacheKey = `${aiProviderName()}::${jsonMode ? 'json' : 'txt'}::${hashString(systemInstruction + '|' + prompt)}`;
+  const modelKey = options.model || 'fast';
+  const cacheKey = `${aiProviderName()}::${modelKey}::${jsonMode ? 'json' : 'txt'}::${hashString(systemInstruction + '|' + prompt)}`;
 
   if (useCache) {
     const hit = aiCache.get(cacheKey);
@@ -73,13 +104,17 @@ const generateText = async (
 
   // --- Provider 1: Gemini ---
   if (process.env.GEMINI_API_KEY) {
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    const ai = getGeminiClient();
+    const modelName = modelKey === 'pro' ? MODEL_PRO : MODEL_FAST;
+    // Default thinkingBudget: 0 (instant) for fast model, -1 (dynamic/full) for pro model.
+    const thinkingBudget = options.thinkingBudget ?? (modelKey === 'pro' ? -1 : 0);
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: modelName,
       contents: prompt,
       config: {
         systemInstruction,
         ...(jsonMode ? { responseMimeType: 'application/json' } : {}),
+        thinkingConfig: { thinkingBudget },
       },
     });
     text = response.text || '';
@@ -208,7 +243,9 @@ Generate ONLY the formatted recommendation letter text with elegant headers, par
 
     const text = await generateText(
       prompt,
-      'You are a formal medical letter-writing assistant. You output only the finished letter.'
+      'You are a formal medical letter-writing assistant. You output only the finished letter.',
+      false,
+      { model: 'pro' } // gemini-4-argon — flagship reasoning for highest-quality formal letters
     );
     return res.json({ letter: text, provider: aiProviderName() });
   } catch (error: any) {
@@ -242,6 +279,104 @@ Context focus: ${contextType || 'General Surgical Terminology & Translation'}. T
     return res.status(500).json({
       error: error.message || 'Medical assistant unavailable.',
     });
+  }
+});
+
+// ==========================================
+// AI STATUS — public, no-auth endpoint
+// Reports which AI provider is currently active
+// so the UI can show "Gemini active" vs. "free fallback"
+// and the operator can verify a freshly-set GEMINI_API_KEY
+// without restarting the service.
+// ==========================================
+app.get('/api/ai-status', (_req, res) => {
+  const hasKey = Boolean(process.env.GEMINI_API_KEY);
+  const provider = aiProviderName();
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    provider,
+    geminiActive: hasKey,
+    fastModel: MODEL_FAST,
+    proModel: MODEL_PRO,
+    message: hasKey
+      ? `Gemini is ACTIVE — using ${MODEL_FAST} for instant features and ${MODEL_PRO} for recommendation letters.`
+      : 'Gemini API key is NOT set. The app is running on the free keyless fallback (rate-limited to ~1 request / 45 s / IP). Add GEMINI_API_KEY at https://aistudio.google.com/apikey to activate unlimited Gemini.',
+    keyHintUrl: 'https://aistudio.google.com/apikey',
+    cacheStats: {
+      textEntries: aiCache.size,
+      caseSuggestionEntries: caseSuggestionsCache.size,
+      ttlMs: AI_CACHE_TTL_MS,
+    },
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// ==========================================
+// AI ASSISTANT — STREAMING (Server-Sent Events)
+// Returns token-by-token responses for instant UX.
+// Falls back gracefully to Pollinations (no streaming) when GEMINI_API_KEY
+// is absent — the full reply is sent as one SSE chunk.
+// ==========================================
+app.post('/api/gemini/assistant/stream', async (req, res) => {
+  const { message, contextType, language } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: 'Message is required.' });
+  }
+
+  // SSE headers — disable all proxy buffering for true real-time delivery
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const sendEvent = (type: string, data: any) => {
+    res.write(`event: ${type}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const systemInstruction = `You are the SurgiTrack AI Medical Education & Terminology Assistant.
+STRICT PRIVACY RULE: You only provide generic medical educational assistance, accurate English/German/Arabic surgical terminology, grammar refinement for professional medical portfolios, blank documentation template structures, and surgical guidance.
+You NEVER process real patient names or private patient identifiers.
+If the user mentions an inquiry in English, German, or Arabic, answer accurately and professionally in that language with high clinical precision.
+Context focus: ${contextType || 'General Surgical Terminology & Translation'}. Target language: ${language || 'en'}.`;
+
+  try {
+    if (process.env.GEMINI_API_KEY) {
+      const ai = getGeminiClient();
+      sendEvent('meta', { provider: 'gemini', model: MODEL_FAST });
+
+      const stream = await ai.models.generateContentStream({
+        model: MODEL_FAST,
+        contents: message,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingBudget: 0 }, // instant — no internal reasoning delay
+        },
+      });
+
+      for await (const chunk of stream as any) {
+        const piece = chunk?.text || '';
+        if (piece) sendEvent('token', { text: piece });
+      }
+      sendEvent('done', { provider: 'gemini' });
+    } else {
+      // Fallback: Pollinations (no native streaming) — emit the full reply as one token event
+      sendEvent('meta', { provider: 'pollinations-free', model: 'openai' });
+      try {
+        const reply = await generateText(message, systemInstruction);
+        sendEvent('token', { text: reply });
+        sendEvent('done', { provider: 'pollinations-free' });
+      } catch (err: any) {
+        sendEvent('error', { message: err.message || 'Free AI provider unavailable.' });
+      }
+    }
+  } catch (error: any) {
+    console.error('Error in streaming medical assistant:', error);
+    sendEvent('error', { message: error.message || 'Streaming assistant unavailable.' });
+  } finally {
+    res.end();
   }
 });
 

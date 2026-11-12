@@ -1,11 +1,19 @@
-import React, { useState } from 'react';
-import { Bot, X, Sparkles, Send, ShieldAlert, BookOpen, Languages, FileText } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Bot, X, Sparkles, Send, ShieldAlert, BookOpen, Languages, FileText, Zap } from 'lucide-react';
 import { SupportedLanguage } from '../types';
 
 interface AiAssistantModalProps {
   isOpen: boolean;
   onClose: () => void;
   language: SupportedLanguage;
+}
+
+interface AiStatus {
+  provider: 'gemini' | 'pollinations-free';
+  geminiActive: boolean;
+  fastModel: string;
+  proModel: string;
+  message?: string;
 }
 
 export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onClose, language }) => {
@@ -23,6 +31,25 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
   ]);
   const [loading, setLoading] = useState(false);
   const [activeCategory, setActiveCategory] = useState<'Terminology' | 'German WBO' | 'Grammar' | 'Template'>('Terminology');
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Fetch AI provider status when modal opens (lightweight, no auth)
+  useEffect(() => {
+    if (!isOpen) return;
+    fetch('/api/ai-status')
+      .then(r => r.json())
+      .then(d => setAiStatus(d))
+      .catch(() => setAiStatus(null));
+  }, [isOpen]);
+
+  // Auto-scroll to bottom on new messages / streaming tokens
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [messages, loading]);
 
   if (!isOpen) return null;
 
@@ -43,12 +70,20 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
     };
 
-    setMessages(prev => [...prev, userMsg]);
+    setMessages(prev => [...prev, userMsg, {
+      sender: 'ai' as const,
+      text: '',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    }]);
     setPromptText('');
     setLoading(true);
 
+    // AbortController for graceful cancellation if user closes modal mid-stream
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     try {
-      const res = await fetch('/api/gemini/assistant', {
+      const res = await fetch('/api/gemini/assistant/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -56,32 +91,99 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
           contextType: activeCategory,
           language,
         }),
+        signal: controller.signal,
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Server error');
+      if (!res.body) {
+        // Fallback to non-streaming endpoint
+        const fb = await fetch('/api/gemini/assistant', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, contextType: activeCategory, language }),
+        });
+        const fbData = await fb.json();
+        if (!fb.ok) throw new Error(fbData.error || 'Server error');
+        setMessages(prev => {
+          const next = [...prev];
+          next[next.length - 1] = { ...next[next.length - 1], text: fbData.reply };
+          return next;
+        });
+        return;
+      }
 
-      setMessages(prev => [
-        ...prev,
-        {
-          sender: 'ai',
-          text: data.reply,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        },
-      ]);
+      // Server-Sent Events parser
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let acc = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE messages are separated by \n\n
+        const events = buffer.split('\n\n');
+        buffer = events.pop() || ''; // keep partial remainder
+
+        for (const evtRaw of events) {
+          const lines = evtRaw.split('\n');
+          let evtType = '';
+          let evtData = '';
+          for (const ln of lines) {
+            if (ln.startsWith('event:')) evtType = ln.slice(6).trim();
+            else if (ln.startsWith('data:')) evtData += ln.slice(5).trim();
+          }
+          if (!evtData) continue;
+          try {
+            const parsed = JSON.parse(evtData);
+            if (evtType === 'token' && parsed.text) {
+              acc += parsed.text;
+              setMessages(prev => {
+                const next = [...prev];
+                next[next.length - 1] = { ...next[next.length - 1], text: acc };
+                return next;
+              });
+            } else if (evtType === 'error') {
+              throw new Error(parsed.message || 'AI streaming error');
+            }
+            // 'meta' and 'done' events are informational — could be used to show
+            // provider/model badges per message if desired.
+          } catch {
+            /* ignore malformed chunk */
+          }
+        }
+      }
+
+      if (!acc) {
+        setMessages(prev => {
+          const next = [...prev];
+          next[next.length - 1] = {
+            ...next[next.length - 1],
+            text: '(empty response — please try again)',
+          };
+          return next;
+        });
+      }
     } catch (err: any) {
-      setMessages(prev => [
-        ...prev,
-        {
-          sender: 'ai',
+      if (err.name === 'AbortError') return;
+      setMessages(prev => {
+        const next = [...prev];
+        next[next.length - 1] = {
+          ...next[next.length - 1],
           text: `Error: ${err.message}. Please check your connection or try again.`,
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        },
-      ]);
+        };
+        return next;
+      });
     } finally {
       setLoading(false);
+      abortRef.current = null;
     }
   };
+
+  const geminiBadgeLabel = aiStatus?.geminiActive
+    ? (aiStatus.fastModel?.startsWith('gemini-4') ? 'Gemini 4' : aiStatus.fastModel?.startsWith('gemini-3') ? `Gemini ${aiStatus.fastModel.split('-')[1] || '3'}` : 'Gemini')
+    : 'Free Tier';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fade-in">
@@ -95,8 +197,16 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
             <div>
               <h3 className="font-bold text-base tracking-tight flex items-center gap-2">
                 SurgiTrack AI Medical Assistant
-                <span className="text-[10px] bg-teal-500/30 text-teal-300 px-2 py-0.5 rounded-full font-mono uppercase">
-                  Gemini 2.5
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-full font-mono uppercase flex items-center gap-1 ${
+                    aiStatus?.geminiActive
+                      ? 'bg-emerald-500/30 text-emerald-300 border border-emerald-400/40'
+                      : 'bg-amber-500/30 text-amber-200 border border-amber-400/40'
+                  }`}
+                  title={aiStatus?.message}
+                >
+                  {aiStatus?.geminiActive && <Zap size={9} />}
+                  {geminiBadgeLabel}
                 </span>
               </h3>
               <p className="text-xs text-slate-300">
@@ -139,7 +249,7 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
         </div>
 
         {/* Messages Body */}
-        <div className="flex-1 p-4 overflow-y-auto space-y-3 bg-[#F8FAFC]">
+        <div ref={scrollRef} className="flex-1 p-4 overflow-y-auto space-y-3 bg-[#F8FAFC]">
           {messages.map((m, idx) => (
             <div
               key={idx}
@@ -153,17 +263,13 @@ export const AiAssistantModal: React.FC<AiAssistantModalProps> = ({ isOpen, onCl
                 }`}
               >
                 {m.text}
+                {loading && m.sender === 'ai' && idx === messages.length - 1 && (
+                  <span className="inline-block w-2 h-4 ml-1 bg-teal-500 animate-pulse align-middle" />
+                )}
               </div>
               <span className="text-[10px] text-slate-400 mt-1 px-1">{m.timestamp}</span>
             </div>
           ))}
-
-          {loading && (
-            <div className="flex items-center gap-2 text-xs text-teal-700 bg-teal-50 px-3 py-2 rounded-xl border border-teal-200/70 w-fit">
-              <Sparkles size={14} className="animate-spin" />
-              <span>Analyzing surgical terminology & formulating verified response...</span>
-            </div>
-          )}
         </div>
 
         {/* Quick Suggestion Chips */}

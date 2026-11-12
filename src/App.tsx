@@ -123,6 +123,15 @@ function SurgiTrackApp() {
   // PWA install prompt
   const [installPromptEvt, setInstallPromptEvt] = useState<any>(null);
 
+  // AI provider status (Gemini vs. free fallback) — fetched once on mount.
+  // Drives the small "Gemini Active" pill in the header so the operator can
+  // verify the API key is live without opening DevTools.
+  const [aiStatus, setAiStatus] = useState<{
+    geminiActive: boolean;
+    fastModel?: string;
+    proModel?: string;
+  } | null>(null);
+
   useEffect(() => {
     const handler = (e: Event) => {
       e.preventDefault();
@@ -130,6 +139,13 @@ function SurgiTrackApp() {
     };
     window.addEventListener('beforeinstallprompt', handler);
     return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/ai-status')
+      .then(r => r.json())
+      .then(d => setAiStatus(d))
+      .catch(() => setAiStatus(null));
   }, []);
 
   const handleInstallApp = async () => {
@@ -248,8 +264,28 @@ function SurgiTrackApp() {
             </button>
           </div>
 
-          {/* Center/Right Actions: Sync status, Language, AI Assistant, User Avatar, Logout & Delete icons */}
+          {/* Center/Right Actions: Sync status, AI status, Language, AI Assistant, User Avatar, Logout & Delete icons */}
           <div className="flex items-center gap-2 sm:gap-3">
+            {/* AI Provider Status Pill — shows whether Gemini is live or free-tier fallback */}
+            <a
+              href="https://aistudio.google.com/apikey"
+              target="_blank"
+              rel="noopener noreferrer"
+              className={`hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-bold border transition cursor-pointer ${
+                aiStatus?.geminiActive
+                  ? 'bg-emerald-950/40 text-emerald-300 border-emerald-500/40 hover:bg-emerald-950/60'
+                  : 'bg-amber-950/40 text-amber-300 border-amber-600/40 hover:bg-amber-950/60'
+              }`}
+              title={
+                aiStatus?.geminiActive
+                  ? `Gemini is ACTIVE — fast: ${aiStatus.fastModel || 'gemini-3.8-flash'}, pro: ${aiStatus.proModel || 'gemini-4-argon'}. Click to manage key.`
+                  : 'Gemini API key is NOT set — using free keyless fallback (rate-limited). Click to get a free key at aistudio.google.com/apikey.'
+              }
+            >
+              <Sparkles size={11} className={aiStatus?.geminiActive ? 'text-emerald-400' : 'text-amber-400'} />
+              <span>{aiStatus?.geminiActive ? 'Gemini' : isRTL ? 'AI مجاني' : 'Free AI'}</span>
+            </a>
+
             {/* Sync Indicator */}
             <div
               className={`hidden md:flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-semibold border ${
