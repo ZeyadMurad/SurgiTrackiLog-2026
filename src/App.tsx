@@ -112,6 +112,10 @@ function SurgiTrackApp() {
   const [showYourPostsModal, setShowYourPostsModal] = useState(false);
   const [profileDropdownOpen, setProfileDropdownOpen] = useState(false);
 
+  // Dashboard sub-tab — Learning Curve is now nested INSIDE the Dashboard
+  // (was a separate top-level nav item). Default = Overview.
+  const [dashboardTab, setDashboardTab] = useState<'overview' | 'learning'>('overview');
+
   // Notifications Modal State & Reply State
   const [notificationsModalOpen, setNotificationsModalOpen] = useState(false);
   const [replyingToNotifId, setReplyingToNotifId] = useState<string | null>(null);
@@ -215,14 +219,19 @@ function SurgiTrackApp() {
   const myPostsCount = communityCases.filter(c => (c.userId || (c as any).authorId) === (profile?.userId || user?.uid)).length;
 
   // Primary Navigation Redesign:
-  // 1. Surgical Literature & News, 2. Surgical Community, 3. PubMed Research, 4. Dashboard, 5. Clinical Cases, 6. Logbook Entries (Supervisor Portfolios), 7. Recommendations & Zeugnis, 8. German WBO, 9. Backup & Restore, 10. Profile, 11. Admin (Super Admin only)
+  // - "Learning Curve" is now a tab INSIDE the Dashboard (no longer top-level)
+  // - "Medical Journals" is now a tab INSIDE the Surgical Literature view
+  //   (no longer top-level) — consolidates all research/literature discovery
+  //   into one place.
+  // 1. Surgical Literature & News (incl. Journals tab), 2. Surgical Community,
+  // 3. PubMed Research, 4. Dashboard (incl. Learning Curve tab),
+  // 5. Clinical Cases, 6. Logbook Entries, 7. Recommendations & Zeugnis,
+  // 8. German WBO, 9. Backup & Restore, 10. Profile, 11. Admin (Super Admin only)
   const navItems = [
     { id: 'news', label: t.news, icon: Newspaper },
     { id: 'community', label: isRTL ? 'المجتمع الجراحي' : 'Surgical Community', icon: Users, count: communityCases?.length },
     { id: 'pubmed', label: t.pubmed, icon: BookOpen },
-    { id: 'journals', label: isRTL ? 'المجلات الطبية' : 'Medical Journals', icon: LibraryBig },
     { id: 'dashboard', label: t.dashboard, icon: LayoutDashboard },
-    { id: 'learning', label: isRTL ? 'منحنى التعلم' : 'Learning Curve', icon: TrendingUp },
     { id: 'cases', label: t.cases, icon: FolderPlus, count: cases.length },
     { id: 'supervisors', label: t.logbookEntries || (isRTL ? 'سجل العمليات والمهارات' : 'Logbook Entries'), icon: UserCheck, count: supervisors.length },
     { id: 'accreditation', label: isRTL ? 'الاعتماد الدولي' : 'Accreditation', icon: Globe2 },
@@ -234,10 +243,10 @@ function SurgiTrackApp() {
   ];
 
   // Quick Navigation Items for Bottom Bar (Community, Dashboard, Clinical Cases, Logbook Entries, PubMed, News)
+  // "Learning" removed from bottom bar — it is now a tab inside the Dashboard.
   const quickNavItems = [
     { id: 'community' as ActiveView, label: isRTL ? 'المجتمع' : 'Community', icon: Users, count: communityCases?.length },
     { id: 'dashboard' as ActiveView, label: t.quickNavDashboard, icon: LayoutDashboard },
-    { id: 'learning' as ActiveView, label: isRTL ? 'منحنى التعلم' : 'Learning', icon: TrendingUp },
     { id: 'cases' as ActiveView, label: t.quickNavCases, icon: FolderPlus, count: cases.length },
     { id: 'supervisors' as ActiveView, label: t.quickNavLogbook || (isRTL ? 'سجل العمليات' : 'Logbook'), icon: UserCheck, count: supervisors.length },
     { id: 'pubmed' as ActiveView, label: 'PubMed', icon: BookOpen },
@@ -725,9 +734,42 @@ function SurgiTrackApp() {
           {activeView === 'learning' && <LearningCurveView />}
           {activeView === 'accreditation' && <AccreditationView />}
 
-          {/* 2nd View: My Surgical Dashboard */}
+          {/* 2nd View: My Surgical Dashboard (with nested Learning Curve tab) */}
           {activeView === 'dashboard' && (
             <div className="space-y-6">
+              {/* Dashboard Tab Switcher — Overview ↔ Learning Curve */}
+              <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-1.5 flex items-center gap-1.5 w-fit">
+                <button
+                  onClick={() => setDashboardTab('overview')}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+                    dashboardTab === 'overview'
+                      ? 'bg-[#101C32] text-white shadow-xs'
+                      : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+                  }`}
+                >
+                  <LayoutDashboard size={14} />
+                  <span>{isRTL ? 'نظرة عامة' : 'Overview'}</span>
+                </button>
+                <button
+                  onClick={() => setDashboardTab('learning')}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+                    dashboardTab === 'learning'
+                      ? 'bg-[#0D9488] text-white shadow-xs'
+                      : 'text-slate-600 hover:text-teal-700 hover:bg-teal-50'
+                  }`}
+                >
+                  <TrendingUp size={14} />
+                  <span>{isRTL ? 'منحنى التعلم' : 'Learning Curve'}</span>
+                </button>
+              </div>
+
+              {/* When Learning Curve tab is selected, render the LearningCurveView
+                  INSTEAD of the dashboard overview — keeps analytics cleanly
+                  grouped inside Dashboard per UX redesign request. */}
+              {dashboardTab === 'learning' ? (
+                <LearningCurveView />
+              ) : (
+                <>
               {/* Dashboard Greeting Banner */}
               <div className="bg-[#101C32] rounded-3xl p-6 sm:p-8 text-white shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-6 border border-teal-500/30">
                 <div>
@@ -903,6 +945,8 @@ function SurgiTrackApp() {
                   </div>
                 </div>
               </div>
+                </>
+              )}
             </div>
           )}
 

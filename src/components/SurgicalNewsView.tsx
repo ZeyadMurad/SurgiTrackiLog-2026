@@ -15,11 +15,13 @@ import {
   CheckCircle2,
   Newspaper,
   Calendar,
-  Globe2
+  Globe2,
+  LibraryBig,
 } from 'lucide-react';
 import { useData } from '../context/DataContext';
 import { useAuth } from '../context/AuthContext';
 import { SurgicalArticle } from '../types';
+import { MedicalJournalsView } from './MedicalJournalsView';
 
 interface ExtendedArticle extends SurgicalArticle {
   pmid?: string;
@@ -40,6 +42,11 @@ export const SurgicalNewsView: React.FC = () => {
   const { toggleSaveArticle, isArticleSaved } = useData();
   const { language } = useAuth();
   const isRTL = language === 'ar';
+
+  // Sub-view mode: "feed" (live PubMed/journal stream) vs "journals"
+  // (multi-source Europe PMC / Crossref / Cochrane research engine).
+  // Consolidates ALL literature discovery into one navigation entry.
+  const [viewMode, setViewMode] = useState<'feed' | 'journals'>('feed');
 
   const [articles, setArticles] = useState<ExtendedArticle[]>([]);
   const [loading, setLoading] = useState(true);
@@ -166,6 +173,40 @@ export const SurgicalNewsView: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Top-level Literature Mode Switcher
+          — "Live Feed" (auto-rotating PubMed/journal stream)
+          — "Journal Search" (Europe PMC / Crossref / Cochrane multi-source engine)
+          Consolidates all research discovery into ONE nav entry per UX request. */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-xs p-1.5 flex items-center gap-1.5 w-fit">
+        <button
+          onClick={() => setViewMode('feed')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+            viewMode === 'feed'
+              ? 'bg-[#101C32] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+          }`}
+        >
+          <Newspaper size={14} />
+          <span>{isRTL ? 'بث الأبحاث المباشر' : 'Live Feed'}</span>
+        </button>
+        <button
+          onClick={() => setViewMode('journals')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+            viewMode === 'journals'
+              ? 'bg-[#0D9488] text-white shadow-xs'
+              : 'text-slate-600 hover:text-teal-700 hover:bg-teal-50'
+          }`}
+        >
+          <LibraryBig size={14} />
+          <span>{isRTL ? 'بحث المجلات الطبية' : 'Journal Search'}</span>
+        </button>
+      </div>
+
+      {/* Journal Search sub-view — render MedicalJournalsView inline */}
+      {viewMode === 'journals' ? (
+        <MedicalJournalsView />
+      ) : (
+        <>
       {/* Dynamic Surgical Hub Banner */}
       <div className="bg-[#101C32] rounded-3xl p-6 sm:p-8 text-white shadow-xl flex flex-col md:flex-row md:items-center justify-between gap-6 border border-teal-500/30 relative overflow-hidden">
         <div className="relative z-10">
@@ -534,6 +575,8 @@ export const SurgicalNewsView: React.FC = () => {
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
     </div>
   );

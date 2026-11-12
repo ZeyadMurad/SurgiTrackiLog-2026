@@ -747,11 +747,89 @@ const detectSurgicalCategory = (title: string, journal: string): string => {
   return 'General Surgery';
 };
 
-// In-memory rotating cache for dynamic UI feeds
-let newsCache: { articles: any[]; lastFetch: number } = { articles: [], lastFetch: 0 };
+// In-memory rotating cache for dynamic UI feeds.
+// SHORTENED from 10 min → 90 seconds so the UI auto-rotation (every 5 min
+// client-side, plus manual "Fetch Fresh") always surfaces new studies
+// instead of serving the same cached batch. The cache only protects against
+// identical concurrent requests, never against periodic refresh.
+let newsCache: { articles: any[]; lastFetch: number; theme: number } = { articles: [], lastFetch: 0, theme: 0 };
+const NEWS_CACHE_TTL_MS = 90 * 1000;
+
+// Rotating pool of surgical-research themes. Each refresh picks the NEXT
+// theme (deterministic cycle A→B→C→…→A) so the user sees a clear progression
+// of different surgical topics and never the same feed twice in a row.
+// Each theme bundles: a PubMed query, a "label" reported to the UI, and a
+// preferred sort order.
+const ROTATION_THEMES: Array<{ label: string; query: string; sort: string }> = [
+  {
+    label: 'Top Surgical Journals — Latest Trials',
+    query: '(("Ann Surg"[ta] OR "Br J Surg"[ta] OR "JAMA Surg"[ta] OR "Lancet"[ta]) AND ("surgical"[tiab] OR "trial"[tiab]))',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Vascular & Endovascular Surgery',
+    query: '("Eur J Vasc Endovasc Surg"[ta] OR "J Vasc Surg"[ta] OR "Ann Vasc Surg"[ta]) OR ("endovascular"[tiab] OR "aortic aneurysm"[tiab] OR "limb ischemia"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Surgical Oncology — Resection & Outcomes',
+    query: '("Ann Surg Oncol"[ta] OR "Eur J Surg Oncol"[ta] OR "J Surg Oncol"[ta]) OR (("pancreaticoduodenectomy"[tiab] OR "hepatectomy"[tiab] OR "lymphadenectomy"[tiab]) AND "resection"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Minimally Invasive & Robotic Surgery',
+    query: '("laparoscopic"[tiab] OR "robotic"[tiab] OR "da vinci"[tiab] OR "minimally invasive"[tiab]) AND ("surgery"[tiab] OR "resection"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Surgical Education & Training',
+    query: '("J Surg Educ"[ta] OR "Ann Surg"[ta]) AND ("surgical training"[tiab] OR "resident education"[tiab] OR "surgical simulation"[tiab] OR "operative competency"[tiab])',
+    sort: 'relevance',
+  },
+  {
+    label: 'Trauma, Emergency & Acute Care Surgery',
+    query: '("emergency laparotomy"[tiab] OR "damage control surgery"[tiab] OR "trauma surgery"[tiab] OR "acute care surgery"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Cardiothoracic Surgery',
+    query: '("Ann Thorac Surg"[ta] OR "J Thorac Cardiovasc Surg"[ta] OR "Eur J Cardiothorac Surg"[ta]) AND ("cardiac surgery"[tiab] OR "lobectomy"[tiab] OR "valve repair"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Colorectal & GI Surgery',
+    query: '("colorectal surgery"[tiab] OR "colectomy"[tiab] OR "rectal resection"[tiab] OR "anastomosis"[tiab]) AND ("surgery"[tiab] OR "trial"[tiab])',
+    sort: 'pub_date',
+  },
+  {
+    label: 'Hernia & Abdominal Wall Reconstruction',
+    query: '("hernia"[tiab] OR "abdominal wall reconstruction"[tiab] OR "ventral hernia"[tiab] OR "inguinal hernia"[tiab]) AND ("repair"[tiab] OR "surgery"[tiab])',
+    sort: 'relevance',
+  },
+  {
+    label: 'Surgical Safety, ERAS & Quality',
+    query: '("surgical safety"[tiab] OR "ERAS"[tiab] OR "enhanced recovery"[tiab] OR "perioperative care"[tiab] OR "surgical quality"[tiab])',
+    sort: 'relevance',
+  },
+];
+
+// Fisher-Yates shuffle (in-place) — true random permutation of the pool so
+// even when two refreshes happen to hit the same theme, the sampled subset
+// differs every time.
+const shuffleArray = <T,>(arr: T[]): T[] => {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+};
 
 // Endpoint 3: Dynamic Surgical News & Direct PubMed Feed Integration
-// Dynamically fetches fresh surgical literature from top journals & PubMed with continuous rotation
+// Dynamically fetches fresh surgical literature from top journals & PubMed
+// with CONTINUOUS ROTATION — every refresh surfaces a different surgical
+// theme and a randomly-sampled subset of a large fetch pool, so the user
+// never sees the same study list twice.
 app.get('/api/news', async (req, res) => {
   const source = (req.query.source as string) || 'all'; // 'all', 'journals', 'pubmed'
   const category = (req.query.category as string) || 'All';
@@ -759,49 +837,69 @@ app.get('/api/news', async (req, res) => {
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(24, Math.max(4, Number(req.query.limit) || 12));
 
-  // If cache is fresh (< 10 minutes) and not forced refresh, and no specialty filter requested
+  // Short-TTL cache: only used when NOT a force-refresh AND the request is
+  // for the default All/All feed AND the cache is < 90s old.
   const now = Date.now();
   const cacheAgeMs = now - newsCache.lastFetch;
-  if (!forceRefresh && newsCache.articles.length >= 10 && cacheAgeMs < 10 * 60 * 1000 && category === 'All' && source === 'all') {
+  if (!forceRefresh && newsCache.articles.length >= 10 && cacheAgeMs < NEWS_CACHE_TTL_MS && category === 'All' && source === 'all') {
+    // Even when serving from cache, return a RANDOMIZED slice so the user
+    // sees different articles on each page visit / re-render.
+    const shuffled = shuffleArray(newsCache.articles);
     const startIndex = (page - 1) * limit;
-    const paginated = newsCache.articles.slice(startIndex, startIndex + limit);
+    const paginated = shuffled.slice(startIndex, startIndex + limit);
     return res.json({
-      articles: paginated.length > 0 ? paginated : newsCache.articles.slice(0, limit),
+      articles: paginated.length > 0 ? paginated : shuffled.slice(0, limit),
       totalAvailable: newsCache.articles.length,
       page,
       lastSyncDate: new Date(newsCache.lastFetch).toISOString(),
       status: 'online',
-      sourceType: 'Dynamic Live Surgical Cache',
+      sourceType: `Rotating Surgical Theme #${newsCache.theme + 1} — ${ROTATION_THEMES[newsCache.theme]?.label || 'Live'}`,
     });
   }
 
   try {
-    // Construct dynamic live search queries based on source & category
-    let ncbiQuery = '';
-
-    if (source === 'journals') {
-      // Top international surgical journals specifically
-      ncbiQuery = '("Ann Surg"[ta] OR "Br J Surg"[ta] OR "Eur J Vasc Endovasc Surg"[ta] OR "J Am Coll Surg"[ta] OR "JAMA Surg"[ta] OR "World J Surg"[ta] OR "J Vasc Surg"[ta]) AND ("surgery"[tiab] OR "surgical"[tiab] OR "operative"[tiab])';
-    } else if (category === 'Vascular Surgery') {
-      ncbiQuery = '("Eur J Vasc Endovasc Surg"[ta] OR "J Vasc Surg"[ta] OR "Ann Vasc Surg"[ta]) OR (("vascular surgery"[tiab] OR "endovascular"[tiab] OR "aortic aneurysm"[tiab] OR "limb ischemia"[tiab]) AND "trial"[tiab])';
-    } else if (category === 'General Surgery') {
-      ncbiQuery = '("Br J Surg"[ta] OR "Ann Surg"[ta] OR "World J Surg"[ta] OR "Am J Surg"[ta]) AND ("laparoscopy"[tiab] OR "hernia"[tiab] OR "cholecystectomy"[tiab] OR "colorectal"[tiab] OR "surgical outcome"[tiab])';
-    } else if (category === 'Surgical Oncology') {
-      ncbiQuery = '("Ann Surg Oncol"[ta] OR "Eur J Surg Oncol"[ta] OR "J Surg Oncol"[ta]) OR (("surgical oncology"[tiab] OR "pancreaticoduodenectomy"[tiab] OR "hepatectomy"[tiab] OR "lymphadenectomy"[tiab]) AND "resection"[tiab])';
-    } else if (category === 'Cardiothoracic Surgery') {
-      ncbiQuery = '("Ann Thorac Surg"[ta] OR "J Thorac Cardiovasc Surg"[ta] OR "Eur J Cardiothorac Surg"[ta]) AND ("cardiac surgery"[tiab] OR "lobectomy"[tiab] OR "valve repair"[tiab])';
-    } else if (category === 'Surgical Education') {
-      ncbiQuery = '("J Surg Educ"[ta] OR "Ann Surg"[ta] OR "Br J Surg"[ta]) AND ("surgical training"[tiab] OR "resident education"[tiab] OR "surgical simulation"[tiab] OR "operative competency"[tiab])';
+    // Pick the theme for THIS refresh:
+    //   • forceRefresh → advance to the NEXT theme in the rotation (deterministic cycle)
+    //   • initial / cache miss → start at theme 0
+    //   • category-specific requests → use the theme that matches the category
+    let themeIdx: number;
+    if (category !== 'All') {
+      // Map UI category to the closest theme in the rotation pool
+      const catMap: Record<string, number> = {
+        'Vascular Surgery': 1,
+        'Surgical Oncology': 2,
+        'Surgical Education': 4,
+        'Trauma & Emergency': 5,
+        'Cardiothoracic Surgery': 6,
+        'General Surgery': 0,
+      };
+      themeIdx = catMap[category] ?? 0;
+    } else if (source === 'journals') {
+      themeIdx = 0; // Top Surgical Journals theme
+    } else if (forceRefresh) {
+      // Advance the rotation by 1 (wrap around the pool)
+      themeIdx = (newsCache.theme + 1) % ROTATION_THEMES.length;
     } else {
-      // Broad international surgical literature query incorporating both top journals and high-impact surgical trials
-      ncbiQuery = '(("Ann Surg"[ta] OR "Br J Surg"[ta] OR "Eur J Vasc Endovasc Surg"[ta] OR "J Am Coll Surg"[ta] OR "JAMA Surg"[ta] OR "Lancet"[ta]) AND ("surgical"[tiab] OR "trial"[tiab])) OR ("randomized controlled trial"[pt] AND ("vascular surgery"[tiab] OR "laparoscopic surgery"[tiab] OR "surgical safety"[tiab]))';
+      themeIdx = newsCache.theme || 0;
     }
 
-    // Offset based on page or rotating salt to keep UI fresh and changing
-    const randomOffset = forceRefresh ? Math.floor(Math.random() * 15) : (page - 1) * limit;
-    const fetchMax = Math.max(limit, 20);
+    const theme = ROTATION_THEMES[themeIdx];
+    let ncbiQuery = theme.query;
+    const ncbiSort = theme.sort;
 
-    const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(ncbiQuery)}&retmode=json&retmax=${fetchMax}&retstart=${randomOffset}&sort=pub_date`;
+    // Offset: random within a wider window so even the SAME theme returns
+    // different articles on subsequent refreshes (PubMed sorts by date / relevance,
+    // a larger retstart window reveals older-but-still-recent studies).
+    const randomOffset = forceRefresh
+      ? Math.floor(Math.random() * 40)        // wider window for force-refresh
+      : (page - 1) * limit;
+
+    // Pull a LARGER pool than we need (retmax=40), then randomly sample `limit`
+    // items from it client-side below. This guarantees visual variety even when
+    // PubMed returns the same ordered result set.
+    const fetchMax = Math.max(limit * 3, 40);
+
+    const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(ncbiQuery)}&retmode=json&retmax=${fetchMax}&retstart=${randomOffset}&sort=${ncbiSort}`;
 
     const searchRes = await fetch(searchUrl, {
       headers: { 'User-Agent': 'SurgiTrack/2.0 (medical-surgical-education; contact: scientist@surgitrack.app)' }
@@ -862,21 +960,26 @@ app.get('/api/news', async (req, res) => {
         }).filter(Boolean);
 
         if (fetchedArticles.length > 0) {
-          // If general fetch, update cache
+          // RANDOM SAMPLE from the larger pool — true variety every refresh.
+          const sampled = shuffleArray(fetchedArticles).slice(0, limit);
+
+          // Update cache with the FULL fetched pool (so subsequent non-refresh
+          // requests can re-sample from the same pool without refetching).
           if (category === 'All' && source === 'all') {
             newsCache = {
               articles: fetchedArticles,
               lastFetch: now,
+              theme: themeIdx,
             };
           }
 
           return res.json({
-            articles: fetchedArticles.slice(0, limit),
+            articles: sampled,
             totalAvailable: Number(searchData?.esearchresult?.count) || fetchedArticles.length,
             page,
             lastSyncDate: new Date().toISOString(),
             status: 'online',
-            sourceType: 'NCBI PubMed Live Continuous Feed',
+            sourceType: `Rotating Theme #${themeIdx + 1}/${ROTATION_THEMES.length} — ${theme.label}`,
           });
         }
       }
