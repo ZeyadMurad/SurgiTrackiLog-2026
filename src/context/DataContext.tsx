@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useState, useMemo, useRef } from 'react';
 import {
   collection,
   doc,
@@ -361,7 +361,20 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [recommendations, setRecommendations] = useState<RecommendationLetter[]>([]);
   const [savedArticles, setSavedArticles] = useState<SavedArticle[]>([]);
   const [communityCases, setCommunityCases] = useState<ClinicalCase[]>([]);
-  const [allDoctors, setAllDoctors] = useState<DoctorProfileSummary[]>(INITIAL_COMMUNITY_DOCTORS);
+  // COMMUNITY 2.1 FIX — initial state is EMPTY, not INITIAL_COMMUNITY_DOCTORS.
+  // The mock doctors were previously the DEFAULT state, so if the Firestore
+  // listener hadn't fired yet (or failed silently), the UI showed 5 fake
+  // doctors indefinitely. Now: empty until the real-time listener populates
+  // with actual registered users. The user themselves is always included.
+  const [allDoctors, setAllDoctors] = useState<DoctorProfileSummary[]>([]);
+
+  // Ref to track the latest profile — the Firestore listeners are set up
+  // once when `user` changes, but `profile` loads asynchronously AFTER
+  // the listener is created. Without a ref, the listener closure captures
+  // a stale `profile = null` and never adds the current user to the
+  // directory. The ref always reads the latest value at callback time.
+  const profileRef = useRef(profile);
+  useEffect(() => { profileRef.current = profile; }, [profile]);
 
   // Queue helper methods
   const getOfflineQueue = (): OfflineQueueItem[] => {
@@ -716,17 +729,18 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setSavedArticles(loadedArticles);
     }
 
-    // Community cases loading
+    // Community cases loading — COMMUNITY 2.1: never seed with the mock
+    // INITIAL_COMMUNITY_CASE_8875. If there's no cached state, start empty;
+    // the real-time onSnapshot listener will populate from Firestore.
     try {
       const storedCommunity = localStorage.getItem('surgitrack_local_community_cases');
       if (storedCommunity) {
         setCommunityCases(JSON.parse(storedCommunity));
       } else {
-        setCommunityCases([INITIAL_COMMUNITY_CASE_8875]);
-        localStorage.setItem('surgitrack_local_community_cases', JSON.stringify([INITIAL_COMMUNITY_CASE_8875]));
+        setCommunityCases([]);
       }
     } catch {
-      setCommunityCases([INITIAL_COMMUNITY_CASE_8875]);
+      setCommunityCases([]);
     }
   }, [currentUid]);
 
@@ -856,31 +870,35 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
               showPortfolioToFollowers: u.showPortfolioToFollowers || false,
             });
           });
-          // Always include the current user themselves in the directory
-          if (profile && !realDoctors.some(d => d.userId === profile.userId)) {
+          // COMMUNITY 2.1 FIX — always include the current user themselves.
+          // Uses profileRef.current (not profile) so the latest profile is
+          // read at callback time, even though the listener closure was
+          // created earlier. This fixes the bug where the user signed in
+          // but their own card never appeared in the directory.
+          const currentProfile = profileRef.current;
+          if (currentProfile && !realDoctors.some(d => d.userId === currentProfile.userId)) {
             realDoctors.unshift({
-              userId: profile.userId,
-              fullName: profile.fullName,
-              academicDegree: profile.academicDegree || '',
-              academicTitle: profile.academicTitle || '',
-              specialty: profile.specialty || 'General Surgery',
-              hospital: profile.hospitals || profile.country || '',
-              profilePhotoUrl: profile.profilePhotoUrl || '',
-              biography: profile.biography || '',
-              followersCount: profile.followersCount || 0,
-              followingCount: profile.followingCount || 0,
-              publishedCasesCount: profile.publishedCasesCount || 0,
-              requireApprovalToFollow: profile.requireApprovalToFollow || false,
-              showProgressStats: profile.showProgressStats || false,
-              showPortfolioToFollowers: profile.showPortfolioToFollowers || false,
+              userId: currentProfile.userId,
+              fullName: currentProfile.fullName,
+              academicDegree: currentProfile.academicDegree || '',
+              academicTitle: currentProfile.academicTitle || '',
+              specialty: currentProfile.specialty || 'General Surgery',
+              hospital: currentProfile.hospitals || currentProfile.country || '',
+              profilePhotoUrl: currentProfile.profilePhotoUrl || '',
+              biography: currentProfile.biography || '',
+              followersCount: currentProfile.followersCount || 0,
+              followingCount: currentProfile.followingCount || 0,
+              publishedCasesCount: currentProfile.publishedCasesCount || 0,
+              requireApprovalToFollow: currentProfile.requireApprovalToFollow || false,
+              showProgressStats: currentProfile.showProgressStats || false,
+              showPortfolioToFollowers: currentProfile.showPortfolioToFollowers || false,
             });
           }
-          // COMMUNITY 2.1 — Permanently eliminate mock doctors from the
-          // directory. They are ONLY used as a cold-start fallback when
-          // zero real users have signed up yet. The moment ANY real user
-          // exists, the seed is hidden entirely (PDF Part 1 requirement).
-          const seedFallback = realDoctors.length === 0 ? INITIAL_COMMUNITY_DOCTORS : [];
-          setAllDoctors([...realDoctors, ...seedFallback]);
+          // COMMUNITY 2.1 — NEVER use INITIAL_COMMUNITY_DOCTORS as fallback.
+          // If realDoctors is empty (no users signed up yet, or listener
+          // returned empty), show empty state. Mock doctors are permanently
+          // eliminated from the directory per PDF Part 1.
+          setAllDoctors(realDoctors);
         }, (err) => console.warn('User directory sync warning:', err.message));
 
         setSyncStatus(prev => ({
