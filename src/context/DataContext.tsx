@@ -347,7 +347,7 @@ export const INITIAL_COMMUNITY_DOCTORS: DoctorProfileSummary[] = [
 ];
 
 export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user, profile } = useAuth();
+  const { user, profile, followUser, unfollowUser, acceptFollowRequest: authAcceptFollowRequest, declineFollowRequest: authDeclineFollowRequest, notifyCaseLiked, notifyCaseCommented } = useAuth();
   const currentUid = user?.uid || profile?.userId || 'local-surgeon-001';
 
   const [cases, setCases] = useState<ClinicalCase[]>([]);
@@ -736,6 +736,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     let unsubSessions: (() => void) | undefined;
     let unsubSkills: (() => void) | undefined;
     let unsubCommunity: (() => void) | undefined;
+    let unsubUsers: (() => void) | undefined;
 
     const setupFirestoreListeners = async () => {
       try {
@@ -807,6 +808,64 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
           }
         }, (err) => console.warn('Community sync warning:', err.message));
 
+        // 6. REAL-TIME USER DIRECTORY — replaces the hardcoded
+        // INITIAL_COMMUNITY_DOCTORS list. Listens to the root `users`
+        // collection and projects public profile fields into the
+        // allDoctors state. Deleted / suspended users are filtered out
+        // in real-time so they disappear from suggestions immediately.
+        const usersRef = collection(db, 'users');
+        unsubUsers = onSnapshot(usersRef, (snapshot) => {
+          const realDoctors: DoctorProfileSummary[] = [];
+          const seen = new Set<string>();
+          snapshot.docs.forEach(d => {
+            const u = d.data() as any;
+            // Skip deleted / suspended / deactivated accounts
+            if (u.deletedByAdmin || u.status === 'deleted' || !u.fullName) return;
+            const duid = u.userId || d.id;
+            if (seen.has(duid)) return;
+            seen.add(duid);
+            realDoctors.push({
+              userId: duid,
+              fullName: u.fullName,
+              academicDegree: u.academicDegree || '',
+              academicTitle: u.academicTitle || '',
+              specialty: u.specialty || 'General Surgery',
+              hospital: u.hospitals || u.hospital || u.country || '',
+              profilePhotoUrl: u.profilePhotoUrl || '',
+              biography: u.biography || '',
+              followersCount: u.followersCount || 0,
+              followingCount: u.followingCount || 0,
+              publishedCasesCount: u.publishedCasesCount || 0,
+              requireApprovalToFollow: u.requireApprovalToFollow || false,
+              showProgressStats: u.showProgressStats || false,
+              showPortfolioToFollowers: u.showPortfolioToFollowers || false,
+            });
+          });
+          // Always include the current user themselves in the directory
+          if (profile && !realDoctors.some(d => d.userId === profile.userId)) {
+            realDoctors.unshift({
+              userId: profile.userId,
+              fullName: profile.fullName,
+              academicDegree: profile.academicDegree || '',
+              academicTitle: profile.academicTitle || '',
+              specialty: profile.specialty || 'General Surgery',
+              hospital: profile.hospitals || profile.country || '',
+              profilePhotoUrl: profile.profilePhotoUrl || '',
+              biography: profile.biography || '',
+              followersCount: profile.followersCount || 0,
+              followingCount: profile.followingCount || 0,
+              publishedCasesCount: profile.publishedCasesCount || 0,
+              requireApprovalToFollow: profile.requireApprovalToFollow || false,
+              showProgressStats: profile.showProgressStats || false,
+              showPortfolioToFollowers: profile.showPortfolioToFollowers || false,
+            });
+          }
+          // Merge: prefer real doctors, but keep the legacy seed entries
+          // (so the carousel isn't empty if no users have signed up yet).
+          const seedNotInReal = INITIAL_COMMUNITY_DOCTORS.filter(s => !realDoctors.some(r => r.userId === s.userId));
+          setAllDoctors([...realDoctors, ...seedNotInReal]);
+        }, (err) => console.warn('User directory sync warning:', err.message));
+
         setSyncStatus(prev => ({
           ...prev,
           isSyncing: false,
@@ -826,6 +885,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (unsubSessions) unsubSessions();
       if (unsubSkills) unsubSkills();
       if (unsubCommunity) unsubCommunity();
+      if (unsubUsers) unsubUsers();
     };
   }, [user]);
 
@@ -1097,6 +1157,16 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (user && navigator.onLine) {
       try {
         await setDoc(doc(db, 'communityCases', caseId), updatedCase, { merge: true });
+        // SOCIAL NOTIFICATION — inform the case author (if not self).
+        // Only on the LIKE transition (not unlike) to avoid spam.
+        if (!alreadyLiked && target.userId && target.userId !== currentUid) {
+          await notifyCaseLiked(
+            target.userId,
+            target.authorName || 'Surgeon',
+            caseId,
+            target.primaryDiagnosis || target.caseReference || 'your case'
+          ).catch(() => {});
+        }
       } catch (e) {
         console.warn('Like sync warning:', e);
       }
@@ -1139,65 +1209,56 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (user && navigator.onLine) {
       try {
         await setDoc(doc(db, 'communityCases', caseId), updatedCase, { merge: true });
+        // SOCIAL NOTIFICATION — inform the case author (if not self).
+        if (target.userId && target.userId !== currentUid) {
+          await notifyCaseCommented(
+            target.userId,
+            target.authorName || 'Surgeon',
+            caseId,
+            target.primaryDiagnosis || target.caseReference || 'your case',
+            commentText.trim()
+          ).catch(() => {});
+        }
       } catch (e) {
         console.warn('Comment sync warning:', e);
       }
     }
   };
 
+  // COMMUNITY 2.0 — REAL follow/unfollow delegated to AuthContext (which
+  // writes to the `follows` collection via Firestore transactions and
+  // pushes social notifications). The local `allDoctors` mirror updates
+  // automatically from the real-time users-collection listener.
   const toggleFollowDoctor = async (targetDoctorId: string): Promise<{ status: 'followed' | 'unfollowed' | 'requested' }> => {
-    const currentFollowing = profile?.following || [];
+    if (!profile) throw new Error('No profile.');
+    const currentFollowing = profile.following || [];
     const isFollowing = currentFollowing.includes(targetDoctorId);
     const targetDoc = allDoctors.find(d => d.userId === targetDoctorId);
-    const requiresApproval = targetDoc?.requireApprovalToFollow;
 
     if (isFollowing) {
-      const updatedFollowing = currentFollowing.filter(id => id !== targetDoctorId);
-      if (profile) {
-        profile.following = updatedFollowing;
-      }
-      setAllDoctors(prev =>
-        prev.map(d =>
-          d.userId === targetDoctorId
-            ? { ...d, followersCount: Math.max(0, d.followersCount - 1) }
-            : d
-        )
-      );
+      await unfollowUser(targetDoctorId);
       return { status: 'unfollowed' };
     } else {
-      if (requiresApproval) {
-        return { status: 'requested' };
-      } else {
-        const updatedFollowing = [...currentFollowing, targetDoctorId];
-        if (profile) {
-          profile.following = updatedFollowing;
-        }
-        setAllDoctors(prev =>
-          prev.map(d =>
-            d.userId === targetDoctorId
-              ? { ...d, followersCount: d.followersCount + 1 }
-              : d
-          )
-        );
-        return { status: 'followed' };
-      }
+      const requiresApproval = targetDoc?.requireApprovalToFollow;
+      const result = await followUser(
+        targetDoctorId,
+        targetDoc?.fullName || 'Surgeon',
+        targetDoc?.profilePhotoUrl,
+        targetDoc?.specialty,
+        Boolean(requiresApproval)
+      );
+      return result; // { status: 'followed' } or { status: 'requested' }
     }
   };
 
   const acceptFollowRequest = async (requesterId: string) => {
     if (!profile) return;
-    const pending = profile.pendingFollowRequests || [];
-    const currentFollowers = profile.followers || [];
-    profile.pendingFollowRequests = pending.filter(id => id !== requesterId);
-    if (!currentFollowers.includes(requesterId)) {
-      profile.followers = [...currentFollowers, requesterId];
-    }
+    await authAcceptFollowRequest(requesterId);
   };
 
   const declineFollowRequest = async (requesterId: string) => {
     if (!profile) return;
-    const pending = profile.pendingFollowRequests || [];
-    profile.pendingFollowRequests = pending.filter(id => id !== requesterId);
+    await authDeclineFollowRequest(requesterId);
   };
 
   // CRUD Supervisors

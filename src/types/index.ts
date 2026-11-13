@@ -9,6 +9,10 @@ export interface UserProfile {
   currentPosition: string;
   specialty: string;
   hospitals: string;
+  // Academic / professional fields surfaced in the Community directory
+  university?: string;
+  academicDegree?: string;
+  academicTitle?: string;
   biography: string;
   profilePhotoUrl?: string;
   role: 'normal_user' | 'super_admin';
@@ -20,11 +24,106 @@ export interface UserProfile {
   showProgressStats?: boolean;
   showPortfolioToFollowers?: boolean;
   requireApprovalToFollow?: boolean;
+  // Social graph — REAL Firestore-backed counters (mirrored from `follows`
+  // collection for fast reads). The `following` / `followers` arrays are
+  // retained for backwards compatibility but are NOT the source of truth.
   followers?: string[];
   following?: string[];
+  followersCount?: number;
+  followingCount?: number;
   pendingFollowRequests?: string[];
+  publishedCasesCount?: number;
+  lastSeenAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+// ============================================================
+// COMMUNITY 2.0 — social graph types
+// ============================================================
+
+/** A follow relationship between two users. The document id encodes both
+ *  uids as `${followerId}__${followeeId}` so it is unique per pair. */
+export interface Follow {
+  id: string;
+  followerId: string;
+  followerName: string;
+  followerPhotoUrl?: string;
+  followerSpecialty?: string;
+  followeeId: string;
+  followeeName: string;
+  followeePhotoUrl?: string;
+  followeeSpecialty?: string;
+  status: 'active' | 'pending';
+  createdAt: string;
+  acceptedAt?: string;
+}
+
+/** Backwards-compatible alias for the FollowRequest concept.
+ *  Pending follows ARE Follow docs with status='pending'; this interface
+ *  is kept for components that still call them "requests". */
+export type FollowRequest = Follow;
+
+/** Lightweight public-profile projection of a user for the Community
+ *  directory carousel and search results. Sourced from the `users`
+ *  collection via real-time onSnapshot. */
+export interface DoctorDirectoryEntry {
+  userId: string;
+  fullName: string;
+  specialty: string;
+  hospitals: string;
+  university?: string;
+  country?: string;
+  profilePhotoUrl?: string;
+  followersCount: number;
+  followingCount: number;
+  publishedCasesCount: number;
+  requireApprovalToFollow?: boolean;
+  status?: 'active' | 'deleted';
+}
+
+/** Discriminated union for social notifications. Lives in
+ *  `users/{recipientUid}/socialNotifications/{notifId}`.
+ *  - Old broadcast-style `AppNotification` is preserved for admin pushes. */
+export type SocialNotificationType =
+  | 'follow'
+  | 'follow_request'
+  | 'follow_accepted'
+  | 'follow_declined'
+  | 'like'
+  | 'comment'
+  | 'new_case'
+  | 'admin_action';
+
+export interface SocialNotification {
+  id: string;
+  type: SocialNotificationType;
+  recipientId: string;       // uid of the user who should see this
+  actorId: string;           // uid of the user who triggered the event
+  actorName: string;
+  actorPhotoUrl?: string;
+  actorSpecialty?: string;
+  // Optional context — e.g. the case id / title for like|comment|new_case
+  targetId?: string;         // e.g. communityCaseId
+  targetType?: 'case' | 'profile' | 'request';
+  targetTitle?: string;
+  message: string;           // human-readable summary in the recipient's UI
+  read: boolean;
+  createdAt: string;
+}
+
+/** Server-side audit log entry for admin destructive actions. */
+export interface AuditLogEntry {
+  id: string;
+  action: 'admin_delete_user' | 'self_delete_account' | 'admin_broadcast';
+  actorId: string;
+  actorEmail: string;
+  targetId: string;
+  targetEmail?: string;
+  targetName?: string;
+  reason?: string;
+  timestamp: string;
+  metadata?: Record<string, any>;
 }
 
 export interface InvestigationItem {

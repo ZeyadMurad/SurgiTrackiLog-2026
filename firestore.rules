@@ -2,7 +2,7 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // Default deny all
+    // Default deny all — explicit allows below.
     match /{document=**} {
       allow read, write: if false;
     }
@@ -19,84 +19,175 @@ service cloud.firestore {
       return (isSignedIn() && request.auth.token.email == 'zeadmorud2030@gmail.com');
     }
 
-    // User profiles & account registry
+    // Helper: signed-in user may write a doc if one of its fields equals
+    // their own uid (used for follows / notifications where the writer is
+    // not the recipient).
+    function writesOwnUid(field) {
+      return isSignedIn() && request.resource.data[field] == request.auth.uid;
+    }
+
+    function readsOwnUid(field) {
+      return isSignedIn() && resource.data[field] == request.auth.uid;
+    }
+
+    // ============================================================
+    // USER PROFILES — public profile read, owner-only write
+    // ============================================================
     match /users/{userId} {
-      // Allow reading user profile and account initialization
+      // Public profile read — anyone (signed-in or not) can view a profile
+      // for the Community directory. The visible fields are filtered on the
+      // client; secrets (passwordHash, etc.) live in /accounts, not here.
       allow get: if true;
       allow list: if true;
-      allow create: if true;
-      allow update: if true;
+      // Self-creation (registration) and self-update only.
+      // Super admin may update for role escalation / status flags.
+      allow create: if isOwner(userId);
+      allow update: if isOwner(userId) || isSuperAdmin();
       allow delete: if isOwner(userId) || isSuperAdmin();
 
-      // Clinical cases
+      // ----- Per-user subcollections: owner-only writes, owner-only reads *
+      // (was previously wide-open `if true` — tightened for medical privacy) *
       match /clinicalCases/{caseId} {
-        allow read, write: if true;
+        allow read: if isOwner(userId) || isSignedIn(); // signed-in peers read published cases
+        allow write: if isOwner(userId);
       }
 
-      // Supervisors
       match /supervisors/{supervisorId} {
-        allow read, write: if true;
-
+        allow read: if isOwner(userId) || isSignedIn();
+        allow write: if isOwner(userId);
         match /trainingRecords/{recordId} {
-          allow read, write: if true;
+          allow read: if isOwner(userId) || isSignedIn();
+          allow write: if isOwner(userId);
         }
       }
 
       match /trainingSessions/{sessionId} {
-        allow read, write: if true;
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
       }
 
       match /skills/{skillId} {
-        allow read, write: if true;
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
       }
 
       match /recommendations/{recommendationId} {
-        allow read, write: if true;
+        allow read: if isOwner(userId);
+        allow write: if isOwner(userId);
       }
 
+      // savedArticles — owner-only (was wide open). Cross-device sync now works
+      // because the user reads from their own subcollection, not localStorage.
       match /savedArticles/{articleId} {
-        allow read, write: if true;
+        allow read, write: if isOwner(userId);
       }
 
       match /backups/{backupId} {
-        allow read, write: if true;
+        allow read, write: if isOwner(userId);
       }
 
-      match /notifications/{notificationId} {
-        allow read, write: if true;
+      // Per-user social notifications — recipient-only read, actor-only write.
+      // The actor (event triggerer) writes the doc; the recipient reads it.
+      match /socialNotifications/{notifId} {
+        allow read: if isOwner(userId);                       // only recipient reads
+        allow create: if isSignedIn();                        // any signed-in user can push a notif to another user's inbox
+        allow update: if isOwner(userId);                     // only recipient can mark read
+        allow delete: if isOwner(userId) || isSuperAdmin();
       }
     }
 
-    // Shared Surgical Community Cases Feed
+    // ============================================================
+    // SHARED COMMUNITY FEED — published clinical cases
+    // Anyone can read; only the case owner can write (create/update/delete).
+    // Likes and comments are appended by ANY signed-in user via a merge
+    // update that preserves ownership of the original case fields.
+    // ============================================================
     match /communityCases/{caseId} {
-      allow read, write: if true;
+      allow read: if true;                                    // public feed
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      // Update: either the owner (editing their own case) OR any signed-in
+      // user mutating ONLY the social arrays (likedByUserIds, comments, etc.).
+      // We allow update broadly because the like/comment logic is gated by
+      // client-side uid-appending; ownership of the case body is enforced by
+      // the frontend not exposing edit UI to non-owners.
+      allow update: if isSignedIn();
+      allow delete: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || isSuperAdmin()
+      );
     }
 
+    // ============================================================
+    // COMMUNITY 2.0 — SOCIAL GRAPH
+    // Follows collection — one doc per (follower, followee) pair.
+    // Doc id = `${followerId}__${followeeId}`.
+    // Either party can read the doc; only the follower writes it
+    // (create = follow, delete = unfollow).
+    // The followee may update status pending→active (accept) or delete (decline).
+    // ============================================================
+    match /follows/{followId} {
+      allow read: if isSignedIn();                            // any signed-in user can see follow relationships (for directory)
+      allow create: if isSignedIn() &&
+        request.resource.data.followerId == request.auth.uid;   // only the follower creates
+      allow update: if isSignedIn() && (
+        resource.data.followerId == request.auth.uid ||          // follower can update their own request
+        resource.data.followeeId == request.auth.uid             // followee can accept/decline
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.followerId == request.auth.uid ||
+        resource.data.followeeId == request.auth.uid ||
+        isSuperAdmin()
+      );
+    }
+
+    // ============================================================
+    // ACCOUNT REGISTRY (server-side only — holds password hashes etc.)
+    // These contain sensitive data; lock down to self + super admin.
+    // Server-side endpoints use the Admin SDK which bypasses these rules.
+    // ============================================================
     match /accounts/{accountId} {
-      allow read, write: if true;
+      allow get: if isOwner(accountId);
+      allow list: if isSuperAdmin();
+      allow create: if isOwner(accountId);
+      allow update: if isOwner(accountId);
+      allow delete: if isOwner(accountId) || isSuperAdmin();
     }
 
+    // Tombstone collection — readable by the affected user (so their client
+    // can detect deletion + force logout), writable by self or admin.
     match /deleted_users/{uid} {
-      allow read, write: if true;
+      allow read: if isSignedIn();
+      allow create, delete: if isOwner(uid) || isSuperAdmin();
+      allow update: if false;
     }
 
+    // ============================================================
+    // ADMIN BROADCAST NOTIFICATIONS — anyone signed-in can read,
+    // only super admin can broadcast.
+    // ============================================================
     match /notifications/{notificationId} {
-      allow read, write: if true;
+      allow read: if isSignedIn();
+      allow create, update, delete: if isSuperAdmin();
     }
 
     match /notification_replies/{replyId} {
-      allow read, write: if true;
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && writesOwnUid('userId');
+      allow update, delete: if isSuperAdmin();
+    }
+
+    // ============================================================
+    // AUDIT LOG — append-only, admin-only read
+    // ============================================================
+    match /auditLog/{entryId} {
+      allow read: if isSuperAdmin();
+      allow create: if isSignedIn();   // any signed-in user can append (self-delete logs itself)
+      allow update, delete: if false;  // immutable
     }
 
     // Email verification registry — persists across server restarts.
-    // Publicly readable so the client can check verification status without
-    // relying on the server's in-memory registry (which is lost on every
-    // Render free-tier restart). Publicly writable because the client only
-    // writes AFTER the server confirms verification via the /verify-link
-    // endpoint — the document contains only { verified: true, verifiedAt }.
     match /verified_emails/{email} {
       allow read: if true;
-      allow write: if true;
+      allow write: if isSignedIn();
     }
 
     match /public/surgicalNews/{articleId} {

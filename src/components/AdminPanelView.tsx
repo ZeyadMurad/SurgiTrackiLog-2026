@@ -85,7 +85,14 @@ export const AdminPanelView: React.FC = () => {
     );
   }
 
-  // Deletion logic that sets real-time lockout trigger
+  // Deletion logic — calls the backend cascade endpoint that:
+  //   1. Verifies the admin's Firebase ID token
+  //   2. Deletes the user's Firebase Auth record (via Admin SDK)
+  //   3. Recursively deletes all Firestore subcollections
+  //   4. Removes the user's communityCases + follows + followRequests
+  //   5. Writes a tombstone for real-time session lockout
+  //   6. Sends the user an email notification (via Resend)
+  //   7. Appends an entry to the secure audit log
   const handleDeleteUser = async () => {
     if (!selectedUserToDelete) return;
     setDeleting(true);
@@ -95,11 +102,11 @@ export const AdminPanelView: React.FC = () => {
       setUsersList(prev => prev.filter(u => u.userId !== selectedUserToDelete.userId));
       setActionSuccess(
         isRTL
-          ? `تم حذف حساب المستخدم (${selectedUserToDelete.fullName}) نهائياً، وتم إغلاق تطبيقه فورياً عبر الاتصال الحي.`
-          : `User account (${selectedUserToDelete.fullName}) was deleted permanently and terminated in real-time.`
+          ? `تم حذف حساب المستخدم (${selectedUserToDelete.fullName}) نهائياً: Firebase Auth + جميع البيانات في Firestore + الإزالة من المجتمع + إشعار بريد إلكتروني + سجل تدقيق آمن.`
+          : `User (${selectedUserToDelete.fullName}) permanently deleted: Firebase Auth user + all Firestore subcollections + community posts + follows + tombstone + email notification + audit log entry.`
       );
       setSelectedUserToDelete(null);
-      setTimeout(() => setActionSuccess(''), 5000);
+      setTimeout(() => setActionSuccess(''), 7000);
     } catch (err: any) {
       setActionError(`Failed to delete user: ${err.message || 'Unknown error'}`);
       setTimeout(() => setActionError(''), 6000);

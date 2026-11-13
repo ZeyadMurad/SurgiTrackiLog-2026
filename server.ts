@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI } from '@google/genai';
+import * as admin from 'firebase-admin';
 
 // Load environment variables.
 // Priority (highest first):
@@ -20,6 +21,411 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
+
+// ============================================================
+// FIREBASE ADMIN SDK — for trusted backend operations
+// (account deletion + audit log + admin user management).
+// Initialization is OPTIONAL: if FIREBASE_SERVICE_ACCOUNT_B64 env var is
+// not set, admin endpoints gracefully fall back to Firestore-only cascade
+// (still writes a tombstone, still locks the user out via real-time
+// listener, but does NOT remove the Firebase Auth user record).
+//
+// To enable full Auth deletion:
+//   1. Render Dashboard → Environment → Add variable FIREBASE_SERVICE_ACCOUNT_B64
+//   2. Value = base64-encoded JSON of your Firebase service account key
+//      (downloadable from Firebase Console → Project Settings → Service
+//      Accounts → Generate new private key)
+//   3. On Linux/macOS: base64 -i serviceAccount.json | tr -d '\n' | pbcopy
+// ============================================================
+let adminApp: admin.app.App | null = null;
+let adminDb: admin.firestore.Firestore | null = null;
+let adminAuth: admin.auth.Auth | null = null;
+
+try {
+  const b64 = process.env.FIREBASE_SERVICE_ACCOUNT_B64;
+  if (b64 && b64.length > 50) {
+    const jsonStr = Buffer.from(b64, 'base64').toString('utf8');
+    const serviceAccount = JSON.parse(jsonStr);
+    adminApp = admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      // projectId / databaseId come from the service account JSON itself,
+      // but we let the FIREBASE_PROJECT_ID env override if set.
+      ...(process.env.VITE_FIREBASE_PROJECT_ID
+        ? { projectId: process.env.VITE_FIREBASE_PROJECT_ID }
+        : {}),
+    });
+    adminDb = admin.firestore();
+    adminAuth = admin.auth();
+    // Use the named database if specified (matches the client's
+    // VITE_FIREBASE_FIRESTORE_DATABASE_ID).
+    if (process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID) {
+      adminDb = admin.firestore(adminApp);
+    }
+    console.log('[Firebase Admin] SDK initialized — full account deletion enabled.');
+  } else {
+    console.warn('[Firebase Admin] FIREBASE_SERVICE_ACCOUNT_B64 not set — admin endpoints will use Firestore-only cascade (Auth user record NOT deleted).');
+  }
+} catch (err) {
+  console.warn('[Firebase Admin] Initialization failed — falling back to Firestore-only cascade:', (err as Error).message);
+}
+
+/** Recursively delete a Firestore subcollection (e.g. users/{uid}/clinicalCases).
+ *  Firestore has no native recursive delete; we list + batch delete. */
+const deleteSubcollection = async (
+  db: admin.firestore.Firestore,
+  collectionPath: string,
+  batchSize = 100
+): Promise<number> => {
+  let deletedCount = 0;
+  let query = db.collection(collectionPath).orderBy('__name__').limit(batchSize);
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const snapshot = await query.get();
+    if (snapshot.size === 0) break;
+    const batch = db.batch();
+    snapshot.docs.forEach((d) => batch.delete(d.ref));
+    await batch.commit();
+    deletedCount += snapshot.size;
+    if (snapshot.size < batchSize) break;
+    // Continue from the last doc
+    const lastDoc = snapshot.docs[snapshot.size - 1];
+    query = db.collection(collectionPath).orderBy('__name__').startAfter(lastDoc).limit(batchSize);
+  }
+  return deletedCount;
+};
+
+/** Cascade-delete every piece of data owned by `uid`:
+ *  - users/{uid}/* subcollections (clinicalCases, supervisors, trainingSessions,
+ *    skills, recommendations, savedArticles, backups, socialNotifications)
+ *  - users/{uid} profile doc
+ *  - accounts/{uid} shadow registry
+ *  - communityCases authored by uid
+ *  - follows docs where followerId or followeeId == uid
+ *  - tombstone in deleted_users/{uid}
+ *  Returns a summary of what was deleted. */
+const cascadeDeleteUser = async (uid: string): Promise<{
+  authDeleted: boolean;
+  firestoreSummary: Record<string, number>;
+}> => {
+  const summary: Record<string, number> = {};
+
+  if (!adminDb) {
+    // Without Admin SDK we cannot do batched server-side deletes across
+    // subcollections reliably. Return a tombstone-only summary.
+    summary.tombstone = 1;
+    return { authDeleted: false, firestoreSummary: summary };
+  }
+
+  // 1. Subcollections under users/{uid}
+  const subcollections = [
+    'clinicalCases', 'supervisors', 'trainingSessions', 'skills',
+    'recommendations', 'savedArticles', 'backups', 'socialNotifications',
+  ];
+  for (const sub of subcollections) {
+    try {
+      const n = await deleteSubcollection(adminDb, `users/${uid}/${sub}`);
+      if (n > 0) summary[`users/${uid}/${sub}`] = n;
+    } catch (e) {
+      console.warn(`[cascadeDelete] ${sub} for ${uid}:`, (e as Error).message);
+    }
+  }
+  // Training records are nested under supervisors/{supId}/trainingRecords
+  try {
+    const supSnapshot = await adminDb.collection(`users/${uid}/supervisors`).get();
+    for (const supDoc of supSnapshot.docs) {
+      const n = await deleteSubcollection(adminDb, `users/${uid}/supervisors/${supDoc.id}/trainingRecords`);
+      if (n > 0) summary[`users/${uid}/supervisors/${supDoc.id}/trainingRecords`] = n;
+    }
+  } catch (e) {
+    console.warn(`[cascadeDelete] trainingRecords for ${uid}:`, (e as Error).message);
+  }
+
+  // 2. Delete profile + shadow registry docs
+  try { await adminDb.doc(`users/${uid}`).delete(); summary['users/{uid}'] = 1; } catch (e) { /* may not exist */ }
+  try { await adminDb.doc(`accounts/${uid}`).delete(); summary['accounts/{uid}'] = 1; } catch (e) { /* may not exist */ }
+
+  // 3. Delete communityCases authored by this user
+  try {
+    const commSnapshot = await adminDb.collection('communityCases').where('userId', '==', uid).get();
+    const batch = adminDb.batch();
+    commSnapshot.docs.forEach((d) => batch.delete(d.ref));
+    if (commSnapshot.size > 0) {
+      await batch.commit();
+      summary['communityCases'] = commSnapshot.size;
+    }
+  } catch (e) {
+    console.warn(`[cascadeDelete] communityCases for ${uid}:`, (e as Error).message);
+  }
+
+  // 4. Delete follows (as follower or followee)
+  try {
+    const fSnapshot = await adminDb.collection('follows').where('followerId', '==', uid).get();
+    const eSnapshot = await adminDb.collection('follows').where('followeeId', '==', uid).get();
+    const batch = adminDb.batch();
+    fSnapshot.docs.forEach((d) => batch.delete(d.ref));
+    eSnapshot.docs.forEach((d) => batch.delete(d.ref));
+    const total = fSnapshot.size + eSnapshot.size;
+    if (total > 0) {
+      await batch.commit();
+      summary['follows'] = total;
+    }
+  } catch (e) {
+    console.warn(`[cascadeDelete] follows for ${uid}:`, (e as Error).message);
+  }
+
+  // 5. Write tombstone (so other sessions of the same user detect deletion)
+  try {
+    await adminDb.doc(`deleted_users/${uid}`).set({
+      userId: uid,
+      deletedAt: new Date().toISOString(),
+      deletedBy: 'server-cascade',
+      reason: 'Account permanently deleted via server cascade.',
+    });
+    summary['deleted_users/{uid}'] = 1;
+  } catch (e) {
+    console.warn(`[cascadeDelete] tombstone for ${uid}:`, (e as Error).message);
+  }
+
+  // 6. Delete Firebase Auth user (requires Admin SDK)
+  let authDeleted = false;
+  if (adminAuth) {
+    try {
+      await adminAuth.deleteUser(uid);
+      authDeleted = true;
+    } catch (e: any) {
+      // auth/user-not-found is expected if the account was already removed
+      if (e.code !== 'auth/user-not-found') {
+        console.warn(`[cascadeDelete] auth.deleteUser(${uid}):`, e.message);
+      } else {
+        authDeleted = true; // already gone — treat as success
+      }
+    }
+  }
+
+  return { authDeleted, firestoreSummary: summary };
+};
+
+/** Verify the caller's Firebase ID token and return the decoded claims.
+ *  Used by admin endpoints to authorize destructive operations. */
+const verifyCaller = async (req: express.Request): Promise<{
+  uid: string;
+  email?: string;
+} | null> => {
+  const authHeader = req.headers.authorization || '';
+  const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!idToken || !adminAuth) return null;
+  try {
+    const decoded = await adminAuth.verifyIdToken(idToken);
+    return { uid: decoded.uid, email: decoded.email };
+  } catch {
+    return null;
+  }
+};
+
+const SUPER_ADMIN_EMAIL = 'zeadmorud2030@gmail.com';
+
+// ============================================================
+// ACCOUNT MANAGEMENT ENDPOINTS
+// ============================================================
+
+// Self-service permanent account deletion.
+// Caller must be signed-in; their ID token authorizes the cascade.
+app.post('/api/account/delete', async (req, res) => {
+  try {
+    const caller = await verifyCaller(req);
+    if (!caller) {
+      return res.status(401).json({ error: 'Authentication required. Sign in again and retry.' });
+    }
+    const targetUid = caller.uid;
+
+    // Optional reason from client
+    const reason = (req.body?.reason as string) || 'User-initiated permanent deletion.';
+
+    const result = await cascadeDeleteUser(targetUid);
+
+    // Audit log
+    if (adminDb) {
+      try {
+        await adminDb.collection('auditLog').add({
+          id: `audit-${Date.now()}-${targetUid.slice(0, 8)}`,
+          action: 'self_delete_account',
+          actorId: targetUid,
+          actorEmail: caller.email || '',
+          targetId: targetUid,
+          targetEmail: caller.email || '',
+          reason,
+          timestamp: new Date().toISOString(),
+          metadata: { ...result.firestoreSummary, authDeleted: result.authDeleted },
+        });
+      } catch (e) {
+        console.warn('[auditLog] write failed:', (e as Error).message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: result.authDeleted
+        ? 'Account permanently deleted (Auth user + Firestore data + tombstone).'
+        : 'Account data deleted from Firestore + tombstone written. Set FIREBASE_SERVICE_ACCOUNT_B64 on Render to also delete the Firebase Auth user record.',
+      authDeleted: result.authDeleted,
+      deletedCounts: result.firestoreSummary,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/account/delete:', error);
+    return res.status(500).json({ error: error.message || 'Account deletion failed.' });
+  }
+});
+
+// Admin-initiated permanent account deletion.
+// Caller must be the super admin (verified via ID token email claim).
+app.post('/api/admin/users/:uid/delete', async (req, res) => {
+  try {
+    const caller = await verifyCaller(req);
+    if (!caller) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    if (caller.email !== SUPER_ADMIN_EMAIL) {
+      // Also record the unauthorized attempt in the audit log
+      if (adminDb) {
+        try {
+          await adminDb.collection('auditLog').add({
+            id: `audit-unauth-${Date.now()}`,
+            action: 'admin_delete_user',
+            actorId: caller.uid,
+            actorEmail: caller.email || '',
+            targetId: req.params.uid,
+            reason: 'UNAUTHORIZED — caller is not super admin',
+            timestamp: new Date().toISOString(),
+          });
+        } catch (e) { /* ignore */ }
+      }
+      return res.status(403).json({ error: 'Forbidden — super admin privileges required.' });
+    }
+    const targetUid = req.params.uid;
+    if (!targetUid || targetUid.length < 8) {
+      return res.status(400).json({ error: 'A valid target user id is required.' });
+    }
+    // Prevent admin from deleting themselves via this endpoint (use /api/account/delete)
+    if (targetUid === caller.uid) {
+      return res.status(400).json({ error: 'Admin cannot delete their own account via this endpoint. Use /api/account/delete instead.' });
+    }
+
+    const reason = (req.body?.reason as string) || 'Account removed by platform administration.';
+
+    // Fetch target user's email/name for audit log before deletion
+    let targetEmail = '';
+    let targetName = '';
+    if (adminDb) {
+      try {
+        const snap = await adminDb.doc(`users/${targetUid}`).get();
+        if (snap.exists) {
+          targetEmail = snap.data()?.email || '';
+          targetName = snap.data()?.fullName || '';
+        }
+      } catch (e) { /* ignore — proceed with deletion */ }
+    }
+
+    const result = await cascadeDeleteUser(targetUid);
+
+    // Send email notification if the admin has RESEND configured
+    // (delivers the "Your SurgiTrack iLog account has been deleted by the
+    // platform administration" message even though the user can no longer
+    // sign in).
+    if (targetEmail && process.env.RESEND_API_KEY && process.env.SMTP_FROM) {
+      try {
+        const resendRes = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${process.env.RESEND_API_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            from: process.env.SMTP_FROM,
+            to: targetEmail,
+            subject: 'Your SurgiTrack iLog account has been deleted by the platform administration',
+            html: `
+              <p>Dear Dr. ${targetName || 'User'},</p>
+              <p>Your SurgiTrack iLog account has been deleted by the platform administration. You no longer have access to this account.</p>
+              <p>If you believe this was an error, please contact the platform administration directly.</p>
+              <p style="color:#64748b;font-size:12px;margin-top:24px;">SurgiTrack iLog • Platform Administration</p>
+            `,
+          }),
+        });
+        if (!resendRes.ok) {
+          console.warn('[adminDelete] email notification failed:', resendRes.status);
+        }
+      } catch (e) {
+        console.warn('[adminDelete] email send error:', (e as Error).message);
+      }
+    }
+
+    // Audit log
+    if (adminDb) {
+      try {
+        await adminDb.collection('auditLog').add({
+          id: `audit-admin-${Date.now()}-${targetUid.slice(0, 8)}`,
+          action: 'admin_delete_user',
+          actorId: caller.uid,
+          actorEmail: caller.email || '',
+          targetId: targetUid,
+          targetEmail,
+          targetName,
+          reason,
+          timestamp: new Date().toISOString(),
+          metadata: { ...result.firestoreSummary, authDeleted: result.authDeleted },
+        });
+      } catch (e) {
+        console.warn('[auditLog] write failed:', (e as Error).message);
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: result.authDeleted
+        ? `User ${targetName || targetUid} permanently deleted (Auth + Firestore + tombstone + audit log).`
+        : `User ${targetName || targetUid} Firestore data + tombstone + audit log written. Set FIREBASE_SERVICE_ACCOUNT_B64 on Render to also delete the Firebase Auth user record.`,
+      authDeleted: result.authDeleted,
+      deletedCounts: result.firestoreSummary,
+      targetEmail,
+      targetName,
+    });
+  } catch (error: any) {
+    console.error('Error in /api/admin/users/:uid/delete:', error);
+    return res.status(500).json({ error: error.message || 'Admin deletion failed.' });
+  }
+});
+
+// Admin audit log viewer — super admin only
+app.get('/api/admin/audit-log', async (req, res) => {
+  try {
+    const caller = await verifyCaller(req);
+    if (!caller) return res.status(401).json({ error: 'Authentication required.' });
+    if (caller.email !== SUPER_ADMIN_EMAIL) return res.status(403).json({ error: 'Forbidden.' });
+    if (!adminDb) return res.status(503).json({ error: 'Admin SDK not configured.' });
+
+    const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 50));
+    const snap = await adminDb.collection('auditLog').orderBy('timestamp', 'desc').limit(limit).get();
+    const entries = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    return res.json({ entries, count: entries.length });
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Audit log fetch failed.' });
+  }
+});
+
+// Public health endpoint for the Admin SDK configuration status — used by
+// the AdminPanel UI to show whether full Auth deletion is enabled.
+app.get('/api/admin/status', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  return res.json({
+    adminSdkInitialized: Boolean(adminApp),
+    authDeletionEnabled: Boolean(adminAuth),
+    firestoreCascadeEnabled: Boolean(adminDb),
+    message: adminApp
+      ? 'Firebase Admin SDK is ACTIVE — full account deletion + audit log enabled.'
+      : 'Firebase Admin SDK NOT configured. Set FIREBASE_SERVICE_ACCOUNT_B64 on Render to enable full Auth user deletion. Firestore cascade + tombstone + audit log still work.',
+    setupHintUrl: 'https://console.firebase.google.com/project/_/settings/serviceaccounts/adminsdk',
+  });
+});
 
 // ============================================================
 // AI TEXT GENERATION — provider chain

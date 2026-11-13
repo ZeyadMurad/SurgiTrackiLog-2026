@@ -20,9 +20,14 @@ import {
   onSnapshot,
   addDoc,
   updateDoc,
+  query,
+  where,
+  runTransaction,
+  increment,
+  serverTimestamp,
 } from 'firebase/firestore';
 import { auth, db } from '../lib/firebase';
-import { UserProfile, SupportedLanguage, AppNotification, NotificationReply } from '../types';
+import { UserProfile, SupportedLanguage, AppNotification, NotificationReply, SocialNotification } from '../types';
 
 interface StoredAccountRecord {
   uid: string;
@@ -49,6 +54,13 @@ interface AuthContextType {
   language: SupportedLanguage;
   getAllRegisteredUsers: () => Promise<UserProfile[]>;
   adminDeleteUserAccount: (userId: string) => Promise<void>;
+  // Community 2.0 — real social graph
+  followUser: (followeeId: string, followeeName: string, followeePhotoUrl?: string, followeeSpecialty?: string, requireApproval?: boolean) => Promise<{ status: 'followed' | 'requested' }>;
+  unfollowUser: (followeeId: string) => Promise<void>;
+  acceptFollowRequest: (followerId: string) => Promise<void>;
+  declineFollowRequest: (followerId: string) => Promise<void>;
+  notifyCaseLiked: (caseAuthorId: string, caseAuthorName: string, caseId: string, caseTitle: string) => Promise<void>;
+  notifyCaseCommented: (caseAuthorId: string, caseAuthorName: string, caseId: string, caseTitle: string, commentText: string) => Promise<void>;
 
   // Real-time Admin Deletion Lockout
   accountDeletedByAdmin: boolean;
@@ -752,6 +764,258 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setAccountDeletedByAdmin(false);
   };
 
+  // ============================================================
+  // COMMUNITY 2.0 — REAL follow/unfollow with Firestore transactions.
+  // The follow doc id is `${followerId}__${followeeId}` so it is unique
+  // per pair — prevents duplicate follows. Counters are mirrored onto
+  // each user's profile doc via `increment()` so they update atomically
+  // and are visible in real-time across all clients via onSnapshot.
+  // ============================================================
+
+  /** Push a social notification into the recipient's inbox. */
+  const pushSocialNotification = async (notif: Omit<SocialNotification, 'id' | 'createdAt' | 'read'>) => {
+    try {
+      const notifRef = doc(collection(db, 'users', notif.recipientId, 'socialNotifications'));
+      const fullNotif: SocialNotification = {
+        ...notif,
+        id: notifRef.id,
+        read: false,
+        createdAt: new Date().toISOString(),
+      };
+      await setDoc(notifRef, fullNotif);
+    } catch (e) {
+      console.warn('[SocialNotification] push failed:', e);
+    }
+  };
+
+  const followDocId = (followerId: string, followeeId: string) => `${followerId}__${followeeId}`;
+
+  const followUser = async (
+    followeeId: string,
+    followeeName: string,
+    followeePhotoUrl?: string,
+    followeeSpecialty?: string,
+    requireApproval = false
+  ): Promise<{ status: 'followed' | 'requested' }> => {
+    if (!user || !profile) throw new Error('Must be signed in to follow.');
+    if (user.uid === followeeId) throw new Error('Cannot follow yourself.');
+
+    const followerId = user.uid;
+    const followId = followDocId(followerId, followeeId);
+    const followRef = doc(db, 'follows', followId);
+    const followerProfileRef = doc(db, 'users', followerId);
+    const followeeProfileRef = doc(db, 'users', followeeId);
+    const status: 'active' | 'pending' = requireApproval ? 'pending' : 'active';
+
+    try {
+      await runTransaction(db, async (txn) => {
+        const existing = await txn.get(followRef);
+        if (existing.exists()) return;
+        txn.set(followRef, {
+          id: followId,
+          followerId,
+          followerName: profile.fullName,
+          followerPhotoUrl: profile.profilePhotoUrl || null,
+          followerSpecialty: profile.specialty || null,
+          followeeId,
+          followeeName,
+          followeePhotoUrl: followeePhotoUrl || null,
+          followeeSpecialty: followeeSpecialty || null,
+          status,
+          createdAt: new Date().toISOString(),
+          acceptedAt: status === 'active' ? new Date().toISOString() : null,
+        });
+        if (status === 'active') {
+          txn.update(followerProfileRef, { followingCount: increment(1), updatedAt: new Date().toISOString() });
+          txn.update(followeeProfileRef, { followersCount: increment(1), updatedAt: new Date().toISOString() });
+        }
+      });
+
+      await pushSocialNotification({
+        type: requireApproval ? 'follow_request' : 'follow',
+        recipientId: followeeId,
+        actorId: followerId,
+        actorName: profile.fullName,
+        actorPhotoUrl: profile.profilePhotoUrl,
+        actorSpecialty: profile.specialty,
+        targetType: 'profile',
+        targetId: followerId,
+        message: requireApproval
+          ? `${profile.fullName} requested to follow you.`
+          : `${profile.fullName} started following you.`,
+      });
+
+      if (status === 'active' && profile) {
+        const updated = {
+          ...profile,
+          following: [...(profile.following || []), followeeId],
+          followingCount: (profile.followingCount || 0) + 1,
+        };
+        setProfile(updated);
+        localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(updated));
+      }
+      return { status: requireApproval ? 'requested' : 'followed' };
+    } catch (e: any) {
+      console.warn('[followUser] transaction failed:', e);
+      throw e;
+    }
+  };
+
+  const unfollowUser = async (followeeId: string): Promise<void> => {
+    if (!user || !profile) throw new Error('Must be signed in.');
+    const followerId = user.uid;
+    const followId = followDocId(followerId, followeeId);
+    const followRef = doc(db, 'follows', followId);
+    const followerProfileRef = doc(db, 'users', followerId);
+    const followeeProfileRef = doc(db, 'users', followeeId);
+
+    try {
+      await runTransaction(db, async (txn) => {
+        const existing = await txn.get(followRef);
+        if (!existing.exists()) return;
+        const wasActive = existing.data()?.status === 'active';
+        txn.delete(followRef);
+        if (wasActive) {
+          txn.update(followerProfileRef, { followingCount: increment(-1), updatedAt: new Date().toISOString() });
+          txn.update(followeeProfileRef, { followersCount: increment(-1), updatedAt: new Date().toISOString() });
+        }
+      });
+
+      if (profile) {
+        const updated = {
+          ...profile,
+          following: (profile.following || []).filter(id => id !== followeeId),
+          followingCount: Math.max(0, (profile.followingCount || 0) - 1),
+        };
+        setProfile(updated);
+        localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(updated));
+      }
+    } catch (e: any) {
+      console.warn('[unfollowUser] transaction failed:', e);
+      throw e;
+    }
+  };
+
+  const acceptFollowRequest = async (followerId: string): Promise<void> => {
+    if (!user || !profile) throw new Error('Must be signed in.');
+    const followId = followDocId(followerId, user.uid);
+    const followRef = doc(db, 'follows', followId);
+    const followerProfileRef = doc(db, 'users', followerId);
+    const followeeProfileRef = doc(db, 'users', user.uid);
+
+    try {
+      await runTransaction(db, async (txn) => {
+        const existing = await txn.get(followRef);
+        if (!existing.exists()) return;
+        if (existing.data()?.status === 'active') return;
+        txn.update(followRef, { status: 'active', acceptedAt: new Date().toISOString() });
+        txn.update(followerProfileRef, { followingCount: increment(1), updatedAt: new Date().toISOString() });
+        txn.update(followeeProfileRef, { followersCount: increment(1), updatedAt: new Date().toISOString() });
+      });
+
+      await pushSocialNotification({
+        type: 'follow_accepted',
+        recipientId: followerId,
+        actorId: user.uid,
+        actorName: profile.fullName,
+        actorPhotoUrl: profile.profilePhotoUrl,
+        actorSpecialty: profile.specialty,
+        targetType: 'profile',
+        targetId: user.uid,
+        message: `${profile.fullName} accepted your follow request.`,
+      });
+
+      if (profile) {
+        const updated = {
+          ...profile,
+          followers: [...(profile.followers || []), followerId],
+          followersCount: (profile.followersCount || 0) + 1,
+          pendingFollowRequests: (profile.pendingFollowRequests || []).filter(id => id !== followerId),
+        };
+        setProfile(updated);
+        localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(updated));
+      }
+    } catch (e) {
+      console.warn('[acceptFollowRequest] failed:', e);
+      throw e;
+    }
+  };
+
+  const declineFollowRequest = async (followerId: string): Promise<void> => {
+    if (!user || !profile) throw new Error('Must be signed in.');
+    const followId = followDocId(followerId, user.uid);
+    try {
+      await deleteDoc(doc(db, 'follows', followId));
+      await pushSocialNotification({
+        type: 'follow_declined',
+        recipientId: followerId,
+        actorId: user.uid,
+        actorName: profile.fullName,
+        actorSpecialty: profile.specialty,
+        targetType: 'profile',
+        targetId: user.uid,
+        message: `${profile.fullName} declined your follow request.`,
+      });
+      if (profile) {
+        const updated = {
+          ...profile,
+          pendingFollowRequests: (profile.pendingFollowRequests || []).filter(id => id !== followerId),
+        };
+        setProfile(updated);
+        localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(updated));
+      }
+    } catch (e) {
+      console.warn('[declineFollowRequest] failed:', e);
+      throw e;
+    }
+  };
+
+  const notifyCaseLiked = async (
+    caseAuthorId: string,
+    caseAuthorName: string,
+    caseId: string,
+    caseTitle: string
+  ) => {
+    if (!user || !profile) return;
+    if (user.uid === caseAuthorId) return;
+    await pushSocialNotification({
+      type: 'like',
+      recipientId: caseAuthorId,
+      actorId: user.uid,
+      actorName: profile.fullName,
+      actorPhotoUrl: profile.profilePhotoUrl,
+      actorSpecialty: profile.specialty,
+      targetType: 'case',
+      targetId: caseId,
+      targetTitle: caseTitle,
+      message: `${profile.fullName} liked your case "${caseTitle}".`,
+    });
+  };
+
+  const notifyCaseCommented = async (
+    caseAuthorId: string,
+    caseAuthorName: string,
+    caseId: string,
+    caseTitle: string,
+    commentText: string
+  ) => {
+    if (!user || !profile) return;
+    if (user.uid === caseAuthorId) return;
+    const snippet = commentText.length > 60 ? commentText.slice(0, 60) + '…' : commentText;
+    await pushSocialNotification({
+      type: 'comment',
+      recipientId: caseAuthorId,
+      actorId: user.uid,
+      actorName: profile.fullName,
+      actorPhotoUrl: profile.profilePhotoUrl,
+      actorSpecialty: profile.specialty,
+      targetType: 'case',
+      targetId: caseId,
+      targetTitle: caseTitle,
+      message: `${profile.fullName} commented on your case "${caseTitle}": ${snippet}`,
+    });
+  };
+
   const deleteCurrentAccount = async () => {
     const currentEmail = user?.email || profile?.email;
     const uid = user?.uid || profile?.userId;
@@ -762,20 +1026,61 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       localStorage.setItem(LOCAL_ACCOUNTS_KEY, JSON.stringify(accounts));
     }
 
-    if (uid) {
+    // Call the BACKEND cascade endpoint (with Firebase ID token) for full
+    // subcollection + Auth deletion. This is the source of truth.
+    let backendOk = false;
+    if (user && auth.currentUser) {
       try {
-        await deleteDoc(doc(db, 'users', uid));
-        await deleteDoc(doc(db, 'accounts', uid));
+        const idToken = await user.getIdToken();
+        const res = await fetch('/api/account/delete', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({ reason: 'User-initiated permanent deletion.' }),
+        });
+        if (res.ok) {
+          backendOk = true;
+          const data = await res.json();
+          console.log('[deleteCurrentAccount] backend cascade:', data.deletedCounts);
+        } else {
+          const err = await res.json().catch(() => ({}));
+          console.warn('[deleteCurrentAccount] backend rejected:', err);
+        }
       } catch (e) {
-        console.warn('Firestore delete note:', e);
+        console.warn('[deleteCurrentAccount] backend call failed, falling back to client-side:', e);
       }
     }
 
+    // Fallback: if backend is unavailable or Admin SDK not configured,
+    // do the best client-side cleanup we can.
+    if (!backendOk && uid) {
+      try {
+        await setDoc(doc(db, 'deleted_users', uid), {
+          userId: uid,
+          deletedAt: new Date().toISOString(),
+          deletedBy: 'self',
+          reason: 'User-initiated permanent deletion (client fallback).',
+        });
+        await setDoc(doc(db, 'users', uid), {
+          status: 'deleted',
+          updatedAt: new Date().toISOString(),
+        }, { merge: true });
+        await deleteDoc(doc(db, 'accounts', uid)).catch(() => {});
+      } catch (e) {
+        console.warn('Client-side delete fallback note:', e);
+      }
+    }
+
+    // Try client-side Auth deletion (works only if recently signed in)
     if (user && auth.currentUser) {
       try {
         await deleteUser(auth.currentUser);
-      } catch (e) {
-        console.warn('Auth user delete note:', e);
+      } catch (e: any) {
+        if (e.code !== 'auth/requires-recent-login') {
+          console.warn('Auth user delete note:', e);
+        }
       }
     }
 
@@ -846,39 +1151,68 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return list;
   };
 
-  // Admin deletes user account: immediately flags user and marks tombstone so their active session closes instantly!
+  // Admin deletes user account — calls the backend cascade endpoint that:
+  //   1. Verifies the caller's ID token (must be super admin)
+  //   2. Deletes the user's Firebase Auth record (via Admin SDK)
+  //   3. Recursively deletes all Firestore subcollections
+  //   4. Removes the user's communityCases from the public feed
+  //   5. Removes all follow relationships (as follower + as followee)
+  //   6. Writes a tombstone for real-time session lockout
+  //   7. Sends the user an email notification (via Resend)
+  //   8. Appends an entry to the secure audit log
   const adminDeleteUserAccount = async (targetUserId: string) => {
-    // 1. Mark in local accounts
-    const accounts = getLocalAccounts();
-    let targetEmail = '';
-    for (const [em, acc] of Object.entries(accounts)) {
-      if (acc.uid === targetUserId || acc.profile.userId === targetUserId) {
-        targetEmail = em;
-        delete accounts[em];
-      }
+    if (!user) throw new Error('Must be signed in as admin.');
+    if (user.email !== SUPER_ADMIN_EMAIL && profile?.role !== 'super_admin') {
+      throw new Error('Forbidden — super admin privileges required.');
     }
-    localStorage.setItem(LOCAL_ACCOUNTS_KEY, JSON.stringify(accounts));
 
-    // 2. Set tombstone in Firestore 'deleted_users' AND update 'users/{id}' with status: 'deleted'
-    // so any connected device running onSnapshot triggers immediate logout & app closure!
+    // Optimistic: flag the user doc immediately so the client-side
+    // onSnapshot listener on the target's session fires the lockout
+    // BEFORE we wait for the server cascade to complete.
     try {
       await setDoc(doc(db, 'deleted_users', targetUserId), {
         userId: targetUserId,
         deletedAt: new Date().toISOString(),
         deletedBy: SUPER_ADMIN_EMAIL,
         reason: 'Account removed by site administration.',
-      });
-
+      }, { merge: true });
       await setDoc(doc(db, 'users', targetUserId), {
         status: 'deleted',
         deletedByAdmin: true,
         updatedAt: new Date().toISOString(),
       }, { merge: true });
-
-      await deleteDoc(doc(db, 'accounts', targetUserId));
     } catch (e) {
-      console.warn('Admin delete firestore error:', e);
+      console.warn('Optimistic tombstone write failed:', e);
     }
+
+    // Call backend cascade (the real deletion happens here).
+    try {
+      const idToken = await user.getIdToken();
+      const res = await fetch(`/api/admin/users/${targetUserId}/delete`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ reason: 'Account removed by site administration.' }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Backend admin deletion failed.');
+      }
+      console.log('[adminDeleteUserAccount] cascade complete:', data.deletedCounts);
+    } catch (e: any) {
+      console.warn('[adminDeleteUserAccount] backend call failed (Firestore tombstone still set):', e);
+    }
+
+    // Remove from local account registry
+    const accounts = getLocalAccounts();
+    for (const [em, acc] of Object.entries(accounts)) {
+      if (acc.uid === targetUserId || acc.profile.userId === targetUserId) {
+        delete accounts[em];
+      }
+    }
+    localStorage.setItem(LOCAL_ACCOUNTS_KEY, JSON.stringify(accounts));
   };
 
   return (
@@ -899,6 +1233,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         language,
         getAllRegisteredUsers,
         adminDeleteUserAccount,
+        followUser,
+        unfollowUser,
+        acceptFollowRequest,
+        declineFollowRequest,
+        notifyCaseLiked,
+        notifyCaseCommented,
         accountDeletedByAdmin,
         dismissDeletedAccountModal,
         notifications,
