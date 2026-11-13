@@ -376,6 +376,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [user?.uid, profile?.userId]);
 
+  // COMMUNITY 2.1 — REAL-TIME PENDING FOLLOW REQUESTS SYNC.
+  // The UserProfileView renders Accept/Reject buttons from
+  // `profile.pendingFollowRequests`, but that array was previously NEVER
+  // populated from Firestore — the field existed in the type but no listener
+  // wrote to it. This meant a user with requireApprovalToFollow would
+  // receive a follow_request notification but never see the request in their
+  // profile UI, making Accept/Reject unreachable.
+  //
+  // This listener watches the `follows` collection for docs where the
+  // current user is the followee and status is 'pending', and syncs the
+  // follower uids into profile.pendingFollowRequests in real-time.
+  useEffect(() => {
+    const uid = user?.uid || profile?.userId;
+    if (!uid || !profile) return;
+    try {
+      const pendingQ = query(
+        collection(db, 'follows'),
+        where('followeeId', '==', uid),
+        where('status', '==', 'pending')
+      );
+      const unsubPending = onSnapshot(pendingQ, (snap) => {
+        const pendingFollowerIds: string[] = [];
+        snap.forEach((d) => {
+          const f = d.data() as any;
+          if (f.followerId && f.followerId !== uid) pendingFollowerIds.push(f.followerId);
+        });
+        // Only update state if the list actually changed (avoid render loops)
+        const current = profile.pendingFollowRequests || [];
+        const sameLength = current.length === pendingFollowerIds.length;
+        const sameContent = sameLength && current.every(id => pendingFollowerIds.includes(id));
+        if (!sameContent) {
+          const updated = { ...profile, pendingFollowRequests: pendingFollowerIds, updatedAt: new Date().toISOString() };
+          setProfile(updated);
+          localStorage.setItem(LOCAL_PROFILE_KEY, JSON.stringify(updated));
+        }
+      }, (e) => {
+        if (e.code !== 'permission-denied') {
+          console.warn('Pending follow requests listener error:', e);
+        }
+      });
+      return () => unsubPending();
+    } catch (e) {
+      console.warn('Could not attach pending follow requests listener:', e);
+    }
+  }, [user?.uid, profile?.userId]);
+
   // Broadcast Notification to all users (strictly Admin)
   const broadcastNotification = async (notif: { title: string; message: string; category: AppNotification['category'] }) => {
     const isSuperAdmin = user?.email === SUPER_ADMIN_EMAIL || profile?.role === 'super_admin';
