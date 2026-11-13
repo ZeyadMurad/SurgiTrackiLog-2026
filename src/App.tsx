@@ -97,8 +97,10 @@ function SurgiTrackApp() {
     accountDeletedByAdmin,
     dismissDeletedAccountModal,
     notifications,
+    socialNotifications,
     unreadNotificationCount,
     markNotificationAsRead,
+    markAllSocialNotificationsAsRead,
     replyToNotification,
   } = useAuth();
   const { stats, syncStatus, cases, trainingRecords, supervisors, addCase, communityCases } = useData();
@@ -151,6 +153,24 @@ function SurgiTrackApp() {
       .then(d => setAiStatus(d))
       .catch(() => setAiStatus(null));
   }, []);
+
+  // COMMUNITY 2.1 — when the notification panel opens, mark every unread
+  // social notification as read in Firestore + mark every admin broadcast
+  // as read for the current user. Both updates persist across devices via
+  // the real-time onSnapshot listeners in AuthContext. The unread badge
+  // (which combines both counts) disappears immediately.
+  useEffect(() => {
+    if (!notificationsModalOpen) return;
+    // Mark all social notifications as read (batched Firestore write)
+    markAllSocialNotificationsAsRead();
+    // Mark all admin-broadcast notifications as read for this user
+    notifications.forEach(n => {
+      if (!(n.readByUserIds || []).includes(user?.uid || profile?.userId || '')) {
+        markNotificationAsRead(n.id);
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [notificationsModalOpen]);
 
   const handleInstallApp = async () => {
     if (!installPromptEvt) return;
@@ -216,7 +236,11 @@ function SurgiTrackApp() {
     return <AuthView />;
   }
 
-  const myPostsCount = communityCases.filter(c => (c.userId || (c as any).authorId) === (profile?.userId || user?.uid)).length;
+  // COMMUNITY 2.1 — Your Posts badge count. Filter ONLY by userId (the
+  // authoritative key). The previous `|| (c as any).authorId` fallback
+  // was a legacy compatibility shim that caused count mismatches with
+  // DoctorProfileModal (which filters only by userId).
+  const myPostsCount = communityCases.filter(c => c.userId === (user?.uid || profile?.userId)).length;
 
   // Primary Navigation Redesign:
   // - "Learning Curve" is now a tab INSIDE the Dashboard (no longer top-level)
@@ -1049,6 +1073,55 @@ function SurgiTrackApp() {
                 </div>
               )}
 
+              {/* COMMUNITY 2.1 — Social notifications (follows, likes, comments,
+                  new_case from people you follow) render ABOVE admin broadcasts
+                  because they are typically more time-sensitive and personal. */}
+              {socialNotifications.length > 0 && (
+                <div className="space-y-2">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-teal-700 bg-teal-50 px-3 py-1.5 rounded-md border border-teal-100">
+                    {isRTL ? 'إشعارات المجتمع' : 'Community Notifications'}
+                  </div>
+                  {socialNotifications.map((sn) => (
+                    <div
+                      key={sn.id}
+                      className={`p-3 rounded-xl border transition cursor-pointer ${
+                        sn.read
+                          ? 'bg-white border-slate-200'
+                          : 'bg-teal-50/50 border-teal-200 hover:bg-teal-50'
+                      }`}
+                      onClick={() => {
+                        // Navigate to the relevant case / profile if applicable
+                        if (sn.targetType === 'case' && sn.targetId) {
+                          setActiveView('community');
+                          setNotificationsModalOpen(false);
+                        }
+                      }}
+                    >
+                      <div className="flex items-start gap-2.5">
+                        {sn.actorPhotoUrl ? (
+                          <img src={sn.actorPhotoUrl} alt={sn.actorName} className="w-7 h-7 rounded-full object-cover shrink-0" />
+                        ) : (
+                          <div className="w-7 h-7 rounded-full bg-teal-100 text-teal-700 flex items-center justify-center text-[10px] font-bold shrink-0">
+                            {sn.actorName?.slice(0, 1).toUpperCase() || '?'}
+                          </div>
+                        )}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-xs text-slate-800 leading-snug">{sn.message}</p>
+                          <p className="text-[10px] text-slate-400 mt-0.5">
+                            {new Date(sn.createdAt).toLocaleString()}
+                            {sn.actorSpecialty && <> · {sn.actorSpecialty}</>}
+                          </p>
+                        </div>
+                        {!sn.read && (
+                          <span className="w-2 h-2 rounded-full bg-teal-500 shrink-0 mt-1.5"></span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Admin broadcast notifications (legacy `notifications` collection) */}
               {notifications.length > 0 ? (
                 notifications.map((notif) => {
                   const currentUid = profile?.userId || user?.uid;

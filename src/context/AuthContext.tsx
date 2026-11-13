@@ -61,6 +61,14 @@ interface AuthContextType {
   declineFollowRequest: (followerId: string) => Promise<void>;
   notifyCaseLiked: (caseAuthorId: string, caseAuthorName: string, caseId: string, caseTitle: string) => Promise<void>;
   notifyCaseCommented: (caseAuthorId: string, caseAuthorName: string, caseId: string, caseTitle: string, commentText: string) => Promise<void>;
+  /** Notify all active followers of the current user that a new case was published. */
+  notifyFollowersOfNewCase: (caseId: string, caseTitle: string) => Promise<void>;
+  /** Mark every unread social notification for the current user as read. */
+  markAllSocialNotificationsAsRead: () => Promise<void>;
+  /** Real-time social notifications (follows, likes, comments, new_case) from
+   *  the per-user inbox at users/{uid}/socialNotifications. Merged with the
+   *  legacy admin `notifications` collection to drive a single unread badge. */
+  socialNotifications: SocialNotification[];
 
   // Real-time Admin Deletion Lockout
   accountDeletedByAdmin: boolean;
@@ -176,6 +184,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Notifications and replies state
   const [notifications, setNotifications] = useState<AppNotification[]>(getLocalNotifications());
   const [notificationReplies, setNotificationReplies] = useState<NotificationReply[]>(getLocalReplies());
+  // COMMUNITY 2.1 — social notifications (per-user inbox at
+  // users/{uid}/socialNotifications/{notifId}). These are merged with the
+  // legacy admin broadcasts above to drive a single unread badge.
+  const [socialNotifications, setSocialNotifications] = useState<SocialNotification[]>([]);
 
   const setLanguage = (lang: SupportedLanguage) => {
     setLanguageState(lang);
@@ -327,6 +339,43 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
+  // COMMUNITY 2.1 — real-time listener for the signed-in user's personal
+  // social notifications inbox (follows, likes, comments, new_case from
+  // people they follow). Lives at users/{uid}/socialNotifications. The
+  // legacy `notifications` collection above only carries admin broadcasts;
+  // social notifications are per-user and must be merged into the badge
+  // count + rendered in the same panel.
+  useEffect(() => {
+    const uid = user?.uid || profile?.userId;
+    if (!uid) {
+      setSocialNotifications([]);
+      return;
+    }
+    try {
+      const unsubSocial = onSnapshot(
+        collection(db, 'users', uid, 'socialNotifications'),
+        (snap) => {
+          const fetched: SocialNotification[] = [];
+          snap.forEach((d) => {
+            fetched.push({ id: d.id, ...(d.data() as any) });
+          });
+          fetched.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+          setSocialNotifications(fetched);
+        },
+        (e) => {
+          // Permission-denied is expected if the rules haven't been deployed
+          // yet or the user's profile doc doesn't exist. Stay silent.
+          if (e.code !== 'permission-denied') {
+            console.warn('Social notifications listener error:', e);
+          }
+        }
+      );
+      return () => unsubSocial();
+    } catch (e) {
+      console.warn('Could not attach social notifications listener:', e);
+    }
+  }, [user?.uid, profile?.userId]);
+
   // Broadcast Notification to all users (strictly Admin)
   const broadcastNotification = async (notif: { title: string; message: string; category: AppNotification['category'] }) => {
     const isSuperAdmin = user?.email === SUPER_ADMIN_EMAIL || profile?.role === 'super_admin';
@@ -412,9 +461,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const currentUserId = profile?.userId || user?.uid;
-  const unreadNotificationCount = notifications.filter(n =>
-    !currentUserId || !(n.readByUserIds || []).includes(currentUserId)
-  ).length;
+  // COMMUNITY 2.1 — unread badge now combines:
+  //   1. Legacy admin broadcasts where current uid not in readByUserIds
+  //   2. Per-user social notifications where read !== true
+  // Both are persisted in Firestore so the count syncs across devices.
+  const unreadNotificationCount =
+    notifications.filter(n =>
+      !currentUserId || !(n.readByUserIds || []).includes(currentUserId)
+    ).length
+    + socialNotifications.filter(n => !n.read).length;
 
   const loginWithGoogle = async () => {
     const provider = new GoogleAuthProvider();
@@ -1016,6 +1071,71 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
   };
 
+  /** Fan-out: when the current user publishes a new case, query every active
+   *  follower in the `follows` collection and push a `new_case` social
+   *  notification to each follower's inbox. Idempotent — re-running it for
+   *  the same case id will create duplicate notifications, so only call this
+   *  ONCE per publish event (inside `publishCaseToCommunity`). */
+  const notifyFollowersOfNewCase = async (caseId: string, caseTitle: string) => {
+    if (!user || !profile) return;
+    try {
+      // Query every active follow relationship where the current user is the followee
+      const followsSnap = await getDocs(query(
+        collection(db, 'follows'),
+        where('followeeId', '==', user.uid),
+        where('status', '==', 'active')
+      ));
+      if (followsSnap.empty) return;
+
+      const batch: Promise<void>[] = [];
+      followsSnap.forEach((d) => {
+        const f = d.data() as any;
+        const followerId = f.followerId;
+        if (!followerId || followerId === user.uid) return;
+        batch.push(pushSocialNotification({
+          type: 'new_case',
+          recipientId: followerId,
+          actorId: user.uid,
+          actorName: profile.fullName,
+          actorPhotoUrl: profile.profilePhotoUrl,
+          actorSpecialty: profile.specialty,
+          targetType: 'case',
+          targetId: caseId,
+          targetTitle: caseTitle,
+          message: `${profile.fullName} published a new clinical case: "${caseTitle}".`,
+        }));
+      });
+      // Fire-and-forget — don't block publish on notification fan-out
+      await Promise.allSettled(batch);
+    } catch (e) {
+      console.warn('[notifyFollowersOfNewCase] fan-out failed:', e);
+    }
+  };
+
+  /** Mark every unread social notification for the current user as read.
+   *  Called when the notification panel opens. Batches a single updateDoc
+   *  per notification — keeps it simple and avoids needing a Cloud Function. */
+  const markAllSocialNotificationsAsRead = async () => {
+    if (!user || !profile) return;
+    const uid = user.uid;
+    try {
+      const snap = await getDocs(query(
+        collection(db, 'users', uid, 'socialNotifications'),
+        where('read', '==', false)
+      ));
+      if (snap.empty) return;
+      const batch: Promise<void>[] = [];
+      snap.forEach((d) => {
+        batch.push(updateDoc(doc(db, 'users', uid, 'socialNotifications', d.id), { read: true }));
+      });
+      await Promise.allSettled(batch);
+      // Optimistically update local state so the badge disappears immediately
+      setSocialNotifications(prev => prev.map(n => ({ ...n, read: true })));
+    } catch (e) {
+      console.warn('[markAllSocialNotificationsAsRead] failed:', e);
+    }
+  };
+
   const deleteCurrentAccount = async () => {
     const currentEmail = user?.email || profile?.email;
     const uid = user?.uid || profile?.userId;
@@ -1239,6 +1359,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         declineFollowRequest,
         notifyCaseLiked,
         notifyCaseCommented,
+        notifyFollowersOfNewCase,
+        markAllSocialNotificationsAsRead,
+        socialNotifications,
         accountDeletedByAdmin,
         dismissDeletedAccountModal,
         notifications,

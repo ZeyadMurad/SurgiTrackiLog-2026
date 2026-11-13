@@ -1,8 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { X, UserPlus, UserCheck, ShieldCheck, Clock, Award, Building, BookOpen, Lock, CheckCircle2, ChevronRight, FileText } from 'lucide-react';
+import { collection, onSnapshot, query } from 'firebase/firestore';
+import { db } from '../lib/firebase';
 import { useData } from '../context/DataContext';
 import { useAuth } from '../context/AuthContext';
-import { ClinicalCase } from '../types';
+import { ClinicalCase, TrainingRecord } from '../types';
 import { translations } from '../lib/i18n';
 
 interface DoctorProfileModalProps {
@@ -42,6 +44,86 @@ export const DoctorProfileModal: React.FC<DoctorProfileModalProps> = ({
 
   const [followState, setFollowState] = useState<'followed' | 'unfollowed' | 'requested' | null>(null);
 
+  // COMMUNITY 2.1 — real training metrics, queried live from the target
+  // doctor's trainingRecords subcollection (replaces the hardcoded
+  // `|| 280` and `|| 64` mocks that previously showed fake numbers).
+  // Only loaded when the doctor has opted-in (showProgressStats !== false).
+  const [doctorTrainingHours, setDoctorTrainingHours] = useState<number>(0);
+  const [doctorProcedures, setDoctorProcedures] = useState<number>(0);
+
+  useEffect(() => {
+    if (!isOpen || !doctor || doctor.showProgressStats === false) {
+      setDoctorTrainingHours(0);
+      setDoctorProcedures(0);
+      return;
+    }
+    // Real-time listener on the doctor's trainingRecords subcollection.
+    // Uses onSnapshot so the metrics stay in sync if records are added /
+    // edited / verified / deleted while the modal is open.
+    const unsub = onSnapshot(
+      query(collection(db, 'users', doctor.userId, 'supervisors')),
+      (supSnap) => {
+        // trainingRecords are nested under each supervisor doc — fan out
+        // a listener per supervisor and aggregate.
+        let totalHours = 0;
+        let totalProcedures = 0;
+        let remaining = supSnap.size;
+        if (remaining === 0) {
+          setDoctorTrainingHours(0);
+          setDoctorProcedures(0);
+          return;
+        }
+        // Clean up previous per-supervisor listeners when supSnap changes
+        const perSupUnsubs: Array<() => void> = [];
+        supSnap.docs.forEach((supDoc) => {
+          const trUnsub = onSnapshot(
+            collection(db, 'users', doctor.userId, 'supervisors', supDoc.id, 'trainingRecords'),
+            (trSnap) => {
+              trSnap.docs.forEach((d) => {
+                const tr = d.data() as TrainingRecord;
+                // Count valid records only — respect the existing
+                // verification workflow. Only verified / signed records
+                // contribute to the public metric.
+                if (tr.verified === true || tr.signature) {
+                  const hrs = Number(tr.netTrainingHours || 0);
+                  if (!Number.isNaN(hrs) && hrs > 0) totalHours += hrs;
+                  // A training record represents one supervised procedure /
+                  // session — count it as one procedure.
+                  totalProcedures += 1;
+                }
+              });
+              remaining -= 1;
+              if (remaining <= 0) {
+                setDoctorTrainingHours(Math.round(totalHours * 10) / 10);
+                setDoctorProcedures(totalProcedures);
+              }
+            },
+            () => {
+              remaining -= 1;
+              if (remaining <= 0) {
+                setDoctorTrainingHours(Math.round(totalHours * 10) / 10);
+                setDoctorProcedures(totalProcedures);
+              }
+            }
+          );
+          perSupUnsubs.push(trUnsub);
+        });
+        // Stash the cleanup fns on a closure variable so the outer unsub
+        // can tear them down — simpler than tracking via refs.
+        (unsub as any).__perSupUnsubs = perSupUnsubs;
+      },
+      () => {
+        setDoctorTrainingHours(0);
+        setDoctorProcedures(0);
+      }
+    );
+    return () => {
+      unsub();
+      const perSup = (unsub as any).__perSupUnsubs as Array<() => void> | undefined;
+      perSup?.forEach((fn) => fn());
+    };
+  }, [isOpen, doctor?.userId, doctor?.showProgressStats]);
+
   if (!isOpen || !doctor) return null;
 
   const isSelf = profile?.userId === doctor.userId;
@@ -50,7 +132,11 @@ export const DoctorProfileModal: React.FC<DoctorProfileModalProps> = ({
     : (profile?.following || []).includes(doctor.userId);
   const isRequested = followState === 'requested';
 
-  const doctorCases = communityCases.filter(c => c.userId === doctor.userId || c.authorName === doctor.fullName);
+  // COMMUNITY 2.1 FIX — filter ONLY by userId (the authoritative key).
+  // The previous `|| c.authorName === doctor.fullName` fallback caused
+  // false matches when display names differed by whitespace / title
+  // prefix, and missed real cases when the local cache was empty.
+  const doctorCases = communityCases.filter(c => c.userId === doctor.userId);
 
   const handleFollowClick = async () => {
     if (isSelf) return;
@@ -163,7 +249,7 @@ export const DoctorProfileModal: React.FC<DoctorProfileModalProps> = ({
               <span className="text-[10px] text-slate-500 block">{isRTL ? 'يتابع' : 'Following'}</span>
             </div>
             <div className="bg-white p-2.5 rounded-xl border border-slate-200 shadow-2xs">
-              <span className="text-sm font-bold text-teal-800 font-mono">{doctorCases.length || doctor.publishedCasesCount || 1}</span>
+              <span className="text-sm font-bold text-teal-800 font-mono">{doctorCases.length}</span>
               <span className="text-[10px] text-slate-500 block">{isRTL ? 'حالات منشورة' : 'Cases Shared'}</span>
             </div>
           </div>
@@ -189,7 +275,7 @@ export const DoctorProfileModal: React.FC<DoctorProfileModalProps> = ({
                     {isRTL ? 'ساعات التدريب السريري' : 'Documented Training Hours'}
                   </span>
                   <span className="text-base font-bold text-teal-950 font-mono">
-                    {doctor.totalHours || 280} hrs
+                    {doctorTrainingHours} hrs
                   </span>
                 </div>
                 <div className="p-3 bg-teal-50/50 rounded-xl border border-teal-100">
@@ -197,7 +283,7 @@ export const DoctorProfileModal: React.FC<DoctorProfileModalProps> = ({
                     {isRTL ? 'العمليات الجراحية الموثقة' : 'Surgical Procedures'}
                   </span>
                   <span className="text-base font-bold text-teal-950 font-mono">
-                    {doctor.totalProcedures || 64} ops
+                    {doctorProcedures} ops
                   </span>
                 </div>
               </div>

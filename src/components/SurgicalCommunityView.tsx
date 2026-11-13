@@ -24,7 +24,7 @@ import { SURGICAL_SPECIALTIES } from '../lib/medicalDefaults';
 
 export const SurgicalCommunityView: React.FC = () => {
   const { communityCases, allDoctors, addCase, updateCase, deleteCase } = useData();
-  const { profile, language } = useAuth();
+  const { profile, language, user } = useAuth();
   const t = translations[language] || translations.en;
   const isRTL = language === 'ar';
 
@@ -33,10 +33,19 @@ export const SurgicalCommunityView: React.FC = () => {
   const [selectedDoctor, setSelectedDoctor] = useState<any | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingCase, setEditingCase] = useState<ClinicalCase | null>(null);
+  // COMMUNITY 2.1 — feed mode toggle: "All Cases" (every eligible public
+  // case in the network) vs "Following Feed" (only cases authored by
+  // surgeons the current user follows). Per PDF Part 3 — followers must
+  // be able to see new publications from the surgeons they follow.
+  const [feedMode, setFeedMode] = useState<'all' | 'following'>('all');
 
   const specialties = ['All', ...SURGICAL_SPECIALTIES];
 
+  const followingIds = new Set(profile?.following || []);
   const filteredPosts = communityCases.filter(post => {
+    // "Following Feed" filter — only posts authored by a followed surgeon
+    if (feedMode === 'following' && !followingIds.has(post.userId)) return false;
+
     const q = search.toLowerCase();
     const matchSearch =
       post.caseReference.toLowerCase().includes(q) ||
@@ -99,6 +108,40 @@ export const SurgicalCommunityView: React.FC = () => {
         onSelectDoctor={(doc) => setSelectedDoctor(doc)}
       />
 
+      {/* COMMUNITY 2.1 — Feed Mode Toggle: All Cases vs Following Feed.
+          Per PDF Part 3: "Following Feed must retrieve real published cases
+          from accounts followed by the currently authenticated user." */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-1.5 flex items-center gap-1.5 w-fit shadow-xs">
+        <button
+          onClick={() => setFeedMode('all')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+            feedMode === 'all'
+              ? 'bg-[#101C32] text-white shadow-xs'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-50'
+          }`}
+        >
+          <BookOpen size={14} />
+          <span>{isRTL ? 'كل الحالات' : 'All Cases'}</span>
+          <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full ${
+            feedMode === 'all' ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600'
+          }`}>{communityCases.length}</span>
+        </button>
+        <button
+          onClick={() => setFeedMode('following')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold transition cursor-pointer ${
+            feedMode === 'following'
+              ? 'bg-[#0D9488] text-white shadow-xs'
+              : 'text-slate-600 hover:text-teal-700 hover:bg-teal-50'
+          }`}
+        >
+          <Users size={14} />
+          <span>{isRTL ? 'متابعاتي' : 'Following Feed'}</span>
+          <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full ${
+            feedMode === 'following' ? 'bg-white/20 text-white' : 'bg-slate-100 text-slate-600'
+          }`}>{followingIds.size}</span>
+        </button>
+      </div>
+
       {/* 2. Filter & Search Controls */}
       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3">
         <div className="relative flex-1">
@@ -147,21 +190,29 @@ export const SurgicalCommunityView: React.FC = () => {
               <BookOpen size={24} />
             </div>
             <h3 className="text-sm font-bold text-slate-900">
-              {isRTL ? 'لم يتم العثور على حالات منشورة مطابقة' : 'No Published Cases Matching Filter'}
+              {feedMode === 'following'
+                ? (isRTL ? 'لا توجد حالات منشورة من الجراحين الذين تتابعهم' : 'No Cases From Surgeons You Follow')
+                : (isRTL ? 'لم يتم العثور على حالات منشورة مطابقة' : 'No Published Cases Matching Filter')}
             </h3>
             <p className="text-xs text-slate-500 max-w-md mx-auto">
-              {isRTL ? 'جرب تغيير كلمات البحث أو التخصص، أو قم بنشر أول حالة جراحية لك الآن.' : 'Try adjusting your search criteria or publish your surgical case to the community.'}
+              {feedMode === 'following'
+                ? (isRTL
+                  ? 'ابدأ بمتابعة جراحين من قائمة الزملاء أعلاه — ستظهر حالاتهم المنشورة تلقائياً هنا في الوقت الحقيقي.'
+                  : 'Follow surgeons from the colleagues list above — their newly published cases will automatically appear here in real-time.')
+                : (isRTL ? 'جرب تغيير كلمات البحث أو التخصص، أو قم بنشر أول حالة جراحية لك الآن.' : 'Try adjusting your search criteria or publish your surgical case to the community.')}
             </p>
-            <button
-              onClick={() => {
-                setEditingCase(null);
-                setShowAddModal(true);
-              }}
-              className="mt-2 inline-flex items-center gap-1.5 bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs px-4 py-2 rounded-xl transition cursor-pointer shadow-xs"
-            >
-              <Plus size={14} />
-              <span>{isRTL ? 'نشر حالة جديدة' : 'Publish New Case'}</span>
-            </button>
+            {feedMode !== 'following' && (
+              <button
+                onClick={() => {
+                  setEditingCase(null);
+                  setShowAddModal(true);
+                }}
+                className="mt-2 inline-flex items-center gap-1.5 bg-[#0D9488] hover:bg-teal-700 text-white font-bold text-xs px-4 py-2 rounded-xl transition cursor-pointer shadow-xs"
+              >
+                <Plus size={14} />
+                <span>{isRTL ? 'نشر حالة جديدة' : 'Publish New Case'}</span>
+              </button>
+            )}
           </div>
         )}
       </div>

@@ -59,6 +59,12 @@ export const SurgicalCommunityPost: React.FC<SurgicalCommunityPostProps> = ({
   const commentsCount = comments.length || post.commentsCount || 0;
 
   const isFollowingAuthor = (profile?.following || []).includes(post.userId);
+  // COMMUNITY 2.1 — Track pending follow requests so the button can render
+  // the "Requested" state. Uses local state because the requester's profile
+  // doesn't store pendingFollowRequests (only the followee's does, on accept/
+  // decline). When the button is clicked and `toggleFollowDoctor` returns
+  // `{ status: 'requested' }`, we flip this state to true.
+  const [followRequested, setFollowRequested] = useState(false);
 
   const handleLike = async () => {
     if (isLiking) return;
@@ -128,13 +134,23 @@ export const SurgicalCommunityPost: React.FC<SurgicalCommunityPostProps> = ({
         </div>
 
         <div className="flex items-center gap-2">
-          {/* Follow author button (if not own post and not in owner management view) */}
+          {/* COMMUNITY 2.1 — Follow button with three states:
+              Follow → Following → Requested (when approval required).
+              Per PDF Part 2: "The interface must distinguish between
+              Follow / Following / Requested / Accept / Reject". */}
           {!isAuthor && (
             <button
-              onClick={() => toggleFollowDoctor(post.userId)}
+              onClick={async () => {
+                const res = await toggleFollowDoctor(post.userId);
+                if (res.status === 'requested') setFollowRequested(true);
+                else if (res.status === 'unfollowed') setFollowRequested(false);
+              }}
+              disabled={followRequested && !isFollowingAuthor}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition cursor-pointer ${
                 isFollowingAuthor
                   ? 'bg-slate-100 text-slate-700 hover:bg-red-50 hover:text-red-700 border border-slate-200'
+                  : followRequested
+                  ? 'bg-amber-50 text-amber-700 border border-amber-200 cursor-default'
                   : 'bg-teal-50 hover:bg-teal-100 text-teal-800 border border-teal-200'
               }`}
             >
@@ -142,6 +158,11 @@ export const SurgicalCommunityPost: React.FC<SurgicalCommunityPostProps> = ({
                 <>
                   <UserCheck size={12} className="text-teal-700" />
                   <span>{isRTL ? 'تتابعه' : 'Following'}</span>
+                </>
+              ) : followRequested ? (
+                <>
+                  <Clock size={12} className="text-amber-600" />
+                  <span>{isRTL ? 'طلب مرسل' : 'Requested'}</span>
                 </>
               ) : (
                 <>

@@ -36,14 +36,21 @@ export const YourPostsModal: React.FC<YourPostsModalProps> = ({
 
   const currentUid = user?.uid || profile?.userId || 'local-surgeon-001';
 
-  // Filter posts authored by current user (from community cases or published cases)
-  const myPosts = communityCases.filter(c => c.userId === currentUid || c.authorName === profile?.fullName);
+  // COMMUNITY 2.1 — Filter posts authored by current user using ONLY
+  // userId as the authoritative key. The previous `|| c.authorName ===
+  // profile?.fullName` fallback was a fragile heuristic that could match
+  // other surgeons with the same display name, and also caused count
+  // mismatches between "Your Posts" and the public profile's "Cases Shared".
+  const myPosts = communityCases.filter(c => c.userId === currentUid);
 
   // Overall engagement metrics
   const totalLikes = myPosts.reduce((acc, p) => acc + (p.likesCount || 0), 0);
   const totalComments = myPosts.reduce((acc, p) => acc + (p.commentsCount || (p.comments?.length || 0)), 0);
-  const followersCount = profile?.followers?.length || 0;
-  const followingCount = profile?.following?.length || 0;
+  // COMMUNITY 2.1 — use the Firestore-mirrored counters (followersCount /
+  // followingCount on the user doc) instead of array lengths — those arrays
+  // are no longer maintained on the requester's side and were always 0.
+  const followersCount = profile?.followersCount || profile?.followers?.length || 0;
+  const followingCount = profile?.followingCount || profile?.following?.length || 0;
 
   const [editingPost, setEditingPost] = useState<ClinicalCase | null>(null);
 

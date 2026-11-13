@@ -7,6 +7,9 @@ import {
   deleteDoc,
   query,
   onSnapshot,
+  updateDoc,
+  increment,
+  where,
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { useAuth } from './AuthContext';
@@ -347,7 +350,7 @@ export const INITIAL_COMMUNITY_DOCTORS: DoctorProfileSummary[] = [
 ];
 
 export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const { user, profile, followUser, unfollowUser, acceptFollowRequest: authAcceptFollowRequest, declineFollowRequest: authDeclineFollowRequest, notifyCaseLiked, notifyCaseCommented } = useAuth();
+  const { user, profile, followUser, unfollowUser, acceptFollowRequest: authAcceptFollowRequest, declineFollowRequest: authDeclineFollowRequest, notifyCaseLiked, notifyCaseCommented, notifyFollowersOfNewCase } = useAuth();
   const currentUid = user?.uid || profile?.userId || 'local-surgeon-001';
 
   const [cases, setCases] = useState<ClinicalCase[]>([]);
@@ -792,20 +795,32 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }, (err) => console.warn('Skills sync error:', err.message));
 
         // 5. Community Cases Live Listener
+        // COMMUNITY 2.1 FIX — merge the Firestore snapshot WITH the current
+        // optimistic state instead of replacing it. Previously, when the
+        // listener fired after a fresh publish but before the server-side
+        // write had propagated, the snapshot would not yet contain the new
+        // case and would silently wipe the user's optimistic entry — causing
+        // "Your Posts = 2" but "Cases Shared = 0" on the same user's profile.
+        // Now: any local case whose id is NOT in the snapshot is preserved
+        // until either (a) it appears in a subsequent snapshot, or (b) the
+        // user explicitly unpublishes/deletes it.
         const communityRef = collection(db, 'communityCases');
         unsubCommunity = onSnapshot(communityRef, (snapshot) => {
-          if (!snapshot.empty) {
-            const rawList = snapshot.docs.map(d => ({ ...d.data(), id: d.id || d.data().id }) as ClinicalCase);
-            // Merge with default initial 8875 case if not present
-            const has8875 = rawList.some(c => c.caseReference === 'CAS-2026-8875' || c.id === 'comm-case-8875');
-            const merged = dedupeById(has8875 ? rawList : [INITIAL_COMMUNITY_CASE_8875, ...rawList]);
-            setCommunityCases(merged);
+          const rawList = snapshot.empty
+            ? []
+            : snapshot.docs.map(d => ({ ...d.data(), id: d.id || d.data().id }) as ClinicalCase);
+          // Merge with optimistic local state — preserve any local case not yet in Firestore
+          setCommunityCases(prevLocal => {
+            const snapshotIds = new Set(rawList.map(c => c.id));
+            const optimisticOnly = prevLocal.filter(c => !snapshotIds.has(c.id));
+            const merged = dedupeById([...rawList, ...optimisticOnly]);
             try {
               localStorage.setItem('surgitrack_local_community_cases', JSON.stringify(merged));
             } catch (e) {
               console.warn(e);
             }
-          }
+            return merged;
+          });
         }, (err) => console.warn('Community sync warning:', err.message));
 
         // 6. REAL-TIME USER DIRECTORY — replaces the hardcoded
@@ -860,10 +875,12 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
               showPortfolioToFollowers: profile.showPortfolioToFollowers || false,
             });
           }
-          // Merge: prefer real doctors, but keep the legacy seed entries
-          // (so the carousel isn't empty if no users have signed up yet).
-          const seedNotInReal = INITIAL_COMMUNITY_DOCTORS.filter(s => !realDoctors.some(r => r.userId === s.userId));
-          setAllDoctors([...realDoctors, ...seedNotInReal]);
+          // COMMUNITY 2.1 — Permanently eliminate mock doctors from the
+          // directory. They are ONLY used as a cold-start fallback when
+          // zero real users have signed up yet. The moment ANY real user
+          // exists, the seed is hidden entirely (PDF Part 1 requirement).
+          const seedFallback = realDoctors.length === 0 ? INITIAL_COMMUNITY_DOCTORS : [];
+          setAllDoctors([...realDoctors, ...seedFallback]);
         }, (err) => console.warn('User directory sync warning:', err.message));
 
         setSyncStatus(prev => ({
@@ -1042,6 +1059,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const authorPhotoUrl = profile?.profilePhotoUrl || target.authorPhotoUrl || '';
 
     const publishedPayload: Partial<ClinicalCase> = {
+      userId: currentUid,
       isPublished: true,
       publishedAt: new Date().toISOString(),
       authorName,
@@ -1062,7 +1080,29 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       localStorage.setItem('surgitrack_local_community_cases', JSON.stringify(updatedCommunity));
       if (user && navigator.onLine) {
+        // 1. Write to the public community feed (source of truth for followers)
         await setDoc(doc(db, 'communityCases', caseId), fullUpdated);
+        // 2. Atomically increment the author's publishedCasesCount on their
+        //    user doc — this is what the Community directory + profile modal
+        //    read to display "Cases Shared" without re-querying communityCases.
+        try {
+          await updateDoc(doc(db, 'users', user.uid), {
+            publishedCasesCount: increment(1),
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (e) {
+          // If the user doc doesn't exist yet, fall back to setDoc merge
+          await setDoc(doc(db, 'users', user.uid), {
+            publishedCasesCount: 1,
+            updatedAt: new Date().toISOString(),
+          }, { merge: true }).catch(() => {});
+        }
+        // 3. Fan-out: notify every active follower that a new case was published
+        //    (non-blocking — don't make the user wait for the fan-out to complete)
+        notifyFollowersOfNewCase(
+          caseId,
+          target.primaryDiagnosis || target.caseReference || 'New clinical case'
+        ).catch((e) => console.warn('[publishCaseToCommunity] follower fan-out failed:', e));
       }
     } catch (e) {
       console.warn('Community publish warning:', e);
@@ -1077,6 +1117,15 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       localStorage.setItem('surgitrack_local_community_cases', JSON.stringify(updatedCommunity));
       if (user && navigator.onLine) {
         await deleteDoc(doc(db, 'communityCases', caseId));
+        // Decrement the author's publishedCasesCount (keep it in sync — never negative)
+        try {
+          await updateDoc(doc(db, 'users', user.uid), {
+            publishedCasesCount: increment(-1),
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (e) {
+          // best-effort — doc may not exist
+        }
       }
     } catch (e) {
       console.warn('Community unpublish warning:', e);
